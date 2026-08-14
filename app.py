@@ -6,8 +6,13 @@ through the interactive RMSD plot and the 3D viewer.
 """
 
 import os
+import sys
 import tempfile
 import time
+
+# the package lives under src/, add it to the path so the app
+# runs without a pip install
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 import numpy as np
 import plotly.graph_objects as go
