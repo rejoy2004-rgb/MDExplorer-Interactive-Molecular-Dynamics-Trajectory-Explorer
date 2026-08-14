@@ -10,7 +10,7 @@ def calculate_hbonds(system, selection="protein"):
         system.universe,
         donors_sel=selection,
         acceptors_sel=selection,
-        hydrogens_sel="element H or name H* or name HN*",  # avoids needing charge information or element metadata
+        hydrogens_sel="name H* or name HN*",  # avoids needing charge information or element metadata
     )
     hbonds_analysis.run()
 
