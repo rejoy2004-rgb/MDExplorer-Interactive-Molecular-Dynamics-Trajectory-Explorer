@@ -6,3 +6,7 @@ __pycache__/
 *.egg-info/
 .gemini/
 *.log
+NAMD/
+GROMACS/
+MolNumPy/NAMD/
+MolNumPy/GROMACS/

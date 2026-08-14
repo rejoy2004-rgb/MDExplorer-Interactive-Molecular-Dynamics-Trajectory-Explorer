@@ -11,6 +11,7 @@ import time
 
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 from analysis.com import center_of_mass
@@ -43,20 +44,18 @@ def load_and_analyze_v2(top_path, traj_path):
     """Load the files and compute all trajectory-wide analyses once."""
     system = load_simulation(top_path, traj_path)
 
-    analyses = {
-        "rmsd": lambda: calculate_rmsd(system),
-        "rg": lambda: calculate_rg(system),
-        "sasa": lambda: calculate_sasa(system),
-        "hbonds": lambda: calculate_hbonds(system),
-        "rmsf": lambda: calculate_rmsf(system),
-        "secondary": lambda: calculate_secondary_structure(system),
-        "com": lambda: center_of_mass(system),
-    }
-
     results = {}
-    for name, fn in analyses.items():
+    for name, fn in [
+        ("rmsd", calculate_rmsd),
+        ("rg", calculate_rg),
+        ("sasa", calculate_sasa),
+        ("hbonds", calculate_hbonds),
+        ("rmsf", calculate_rmsf),
+        ("secondary", calculate_secondary_structure),
+        ("com", center_of_mass),
+    ]:
         try:
-            results[name] = fn()
+            results[name] = fn(system)
         except Exception:
             results[name] = None  # shown as "Not available" in the UI
     return system, results
@@ -99,29 +98,56 @@ def range_value(results, name, start, end, stat, unit=""):
     return format_value(getattr(np, stat)(vals), unit)
 
 
-def build_rmsd_figure(system, results, frame):
-    rmsd = results["rmsd"]
-    x = np.arange(system.n_frames)
+def build_figure(system, results, frame, metric):
+    """Plot of the selected metric; RMSD and Rg are per frame, RMSF per residue."""
+    if metric == "RMSF":
+        rmsf = results["rmsf"]
+        fig = go.Figure(go.Bar(
+            x=np.arange(len(rmsf)),
+            y=rmsf,
+            hovertemplate="Residue %{x}<br>RMSF %{y:.2f} Å<extra></extra>",
+        ))
+        fig.update_layout(xaxis_title="Residue index", yaxis_title="RMSF (Å)", height=350)
+        return fig
 
+    if metric == "All":
+        fig = make_subplots(rows=3, subplot_titles=("RMSD", "RMSF", "Rg"))
+        if results.get("rmsd") is not None:
+            fig.append_trace(go.Scatter(
+                x=np.arange(system.n_frames), y=results["rmsd"], mode="lines", name="RMSD"
+            ), 1, 1)
+        if results.get("rmsf") is not None:
+            fig.append_trace(go.Bar(
+                x=np.arange(len(results["rmsf"])), y=results["rmsf"], name="RMSF"
+            ), 2, 1)
+        if results.get("rg") is not None:
+            fig.append_trace(go.Scatter(
+                x=np.arange(system.n_frames), y=results["rg"], mode="lines", name="Rg"
+            ), 3, 1)
+        fig.update_layout(height=700)
+        return fig
+
+    is_rmsd = metric == "RMSD"
+    name = "RMSD" if is_rmsd else "Rg"
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=x,
-        y=rmsd,
+        x=np.arange(system.n_frames),
+        y=results["rmsd"] if is_rmsd else results["rg"],
         mode="lines",
-        name="Backbone RMSD",
+        name=name,
         customdata=np.stack([system.time], axis=1),
-        hovertemplate="Frame %{x}<br>Time %{customdata[0]:.1f} ps<br>RMSD %{y:.2f} Å<extra></extra>",
+        hovertemplate="Frame %{x}<br>Time %{customdata[0]:.1f} ps<br>%{y:.2f} Å<extra></extra>",
     ))
     fig.add_vline(x=frame, line_color="red", line_dash="dash", opacity=0.6)
     if st.session_state.get("selected_range"):
         start, end = st.session_state["selected_range"]
         fig.add_vrect(x0=start, x1=end, fillcolor="lightblue", opacity=0.2, line_width=0)
-    fig.update_layout(xaxis_title="Frame", yaxis_title="RMSD (Å)", height=350)
+    fig.update_layout(xaxis_title="Frame", yaxis_title=f"{name} (Å)", height=350)
     return fig
 
 
 def handle_selection(event, n_frames):
-    """React to clicks / box selections on the RMSD graph."""
+    """React to clicks / box selections on the trajectory graph."""
     if event is None:
         return
     points = (event.selection or {}).get("points", [])
@@ -201,27 +227,25 @@ def main():
     render_molecular_viewer(system, frame, width=900, height=520)
     st.slider("Frame", min_value=0, max_value=n_frames - 1, key="frame")
 
-    st.subheader("Backbone RMSD")
-    if results.get("rmsd") is not None:
-        fig = build_rmsd_figure(system, results, frame)
-        event = st.plotly_chart(
-            fig,
-            on_select="rerun",
-            selection_mode=["points", "box", "lasso"],
-            key="rmsd_plot",
-        )
-        handle_selection(event, n_frames)
+    st.subheader("Trajectory analysis")
+    metrics = {"RMSD": results.get("rmsd"), "RMSF": results.get("rmsf"), "Rg": results.get("rg")}
+    options = [name for name, arr in metrics.items() if arr is not None]
+    if not options:
+        st.info("RMSD, RMSF and Rg are not available for this system.")
     else:
-        st.info("RMSD not available.")
-
-    st.subheader("Per-residue RMSF")
-    rmsf = results.get("rmsf")
-    if rmsf is not None:
-        rmsf_fig = go.Figure(go.Bar(x=np.arange(len(rmsf)), y=rmsf))
-        rmsf_fig.update_layout(xaxis_title="Residue index", yaxis_title="RMSF (Å)", height=300)
-        st.plotly_chart(rmsf_fig, width="stretch")
-    else:
-        st.info("RMSF not available.")
+        options.append("All")
+        metric = st.radio("Metric", options, horizontal=True)
+        fig = build_figure(system, results, frame, metric)
+        if metric in ("RMSD", "Rg"):
+            event = st.plotly_chart(
+                fig,
+                on_select="rerun",
+                selection_mode=["points", "box", "lasso"],
+                key="main_plot",
+            )
+            handle_selection(event, n_frames)
+        else:
+            st.plotly_chart(fig, key="main_plot")
 
     st.subheader("Selected frame")
     m1, m2, m3, m4 = st.columns(4)

@@ -23,6 +23,11 @@ class MolecularSystem:
         return self._trajectory
 
     @property
+    def universe(self):
+        """The source MDAnalysis Universe (used by the analysis functions)."""
+        return self._mda_universe
+
+    @property
     def coordinates(self):
         return self._trajectory.coordinates
 
