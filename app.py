@@ -91,7 +91,11 @@ def format_secondary(dssp, frame):
     if dssp is None:
         return "Not available"
     helix, sheet, coil = summarize_secondary_structure(dssp[frame])
-    return f"H {helix:.0f}%  S {sheet:.0f}%  C {coil:.0f}%"
+    return (
+        f"- H (helix): {helix:.0f}%\n"
+        f"- S (strand): {sheet:.0f}%\n"
+        f"- C (coil): {coil:.0f}%"
+    )
 
 
 def range_value(results, name, start, end, stat, unit=""):
@@ -261,7 +265,8 @@ def main():
     m3.metric("SASA", format_value(frame_value(results, "sasa", frame), "Å²"))
     m3.metric("H-bonds", format_value(frame_value(results, "hbonds", frame)))
     m4.metric("Center of mass", format_com(frame_value(results, "com", frame)))
-    m4.metric("Secondary structure", format_secondary(results.get("secondary"), frame))
+    m4.markdown("**Secondary structure**")
+    m4.markdown(format_secondary(results.get("secondary"), frame))
 
     st.subheader("Selected frame range")
     if st.session_state.get("selected_range"):
