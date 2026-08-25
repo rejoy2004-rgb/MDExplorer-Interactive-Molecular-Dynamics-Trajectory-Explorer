@@ -42,7 +42,7 @@ def superimpose(mobile, reference):
     covariance = np.dot(mobile.T, reference)
 
     # the SVD of that matrix gives us the best rotation between the two sets
-    u, s, vt = np.linalg.svd(covariance)
+    u, _, vt = np.linalg.svd(covariance)
 
     # if the determinant is negative the SVD has given a mirror image instead
     # of a rotation, and flipping the last column fixes it
