@@ -1,293 +1,313 @@
-"""MolNumPy - Molecular Dynamics Explorer.
+"""MolNumPy - a small tool for looking at molecular dynamics simulations.
 
-A simple Streamlit app that loads an MD simulation (topology + trajectory),
-computes the analyses once, and lets the user explore frames and ranges
-through the interactive RMSD plot and the 3D viewer.
+Start it from the terminal with:   streamlit run app.py
 """
 
 import os
-import sys
 import tempfile
 import time
-
-# the package lives under src/, add it to the path so the app
-# runs without a pip install
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from analysis.com import center_of_mass
-from analysis.hbonds import calculate_hbonds
-from analysis.rg import calculate_rg
-from analysis.rmsd import calculate_rmsd
-from analysis.rmsf import calculate_rmsf
-from analysis.sasa import calculate_sasa
-from analysis.secondary import calculate_secondary_structure, summarize_secondary_structure
-from molnumpy.visualization.viewer import render_molecular_viewer
-from utils.loader import load_simulation
+from molecule import load_simulation, TOPOLOGY_FORMATS, TRAJECTORY_FORMATS
+from viewer import show_structure
+import analysis
 
-st.set_page_config(page_title="MolNumPy", page_icon="🧬", layout="wide")
-
-TOP_EXTENSIONS = [".pdb", ".psf", ".gro", ".tpr", ".prmtop", ".parm7"]
-TRAJ_EXTENSIONS = [".dcd", ".xtc", ".trr", ".nc"]
+st.set_page_config(page_title="MolNumPy", layout="wide")
 
 
-def save_uploaded_file(uploaded_file) -> str:
-    """Save an uploaded file to a temporary path so readers can open it."""
-    ext = os.path.splitext(uploaded_file.name)[1]
-    fd, path = tempfile.mkstemp(suffix=ext)
-    with os.fdopen(fd, "wb") as f:
+def save_upload(uploaded_file):
+    """Streamlit keeps uploads in memory, but the readers need a real file.
+
+    So we write the upload into a temporary file and return its path.
+    """
+    extension = os.path.splitext(uploaded_file.name)[1]
+    handle, path = tempfile.mkstemp(suffix=extension)
+    with os.fdopen(handle, "wb") as f:
         f.write(uploaded_file.getbuffer())
     return path
 
 
-@st.cache_resource
-def load_and_analyze_v2(top_path, traj_path):
-    """Load the files and compute all trajectory-wide analyses once."""
-    system = load_simulation(top_path, traj_path)
+def run_all_analysis(system):
+    """Run every measurement once, right after the files are loaded.
+
+    Not every measurement works on every file. DSSP for example needs a proper
+    protein and fails on a small molecule. So each one is run on its own, and
+    if it fails we store None and the page shows "Not available" instead of the
+    whole program crashing.
+    """
+    to_run = {
+        "rmsd": analysis.calculate_rmsd,
+        "rmsf": analysis.calculate_rmsf,
+        "rg": analysis.calculate_rg,
+        "com": analysis.center_of_mass,
+        "hbonds": analysis.calculate_hbonds,
+        "sasa": analysis.calculate_sasa,
+        "secondary": analysis.calculate_secondary_structure,
+    }
 
     results = {}
-    for name, fn in [
-        ("rmsd", calculate_rmsd),
-        ("rg", calculate_rg),
-        ("sasa", calculate_sasa),
-        ("hbonds", calculate_hbonds),
-        ("rmsf", calculate_rmsf),
-        ("secondary", calculate_secondary_structure),
-        ("com", center_of_mass),
-    ]:
+    for name in to_run:
         try:
-            results[name] = fn(system)
+            results[name] = to_run[name](system)
         except Exception:
-            results[name] = None  # shown as "Not available" in the UI
-    return system, results
+            results[name] = None
+
+    return results
 
 
-def frame_value(results, name, frame):
-    """Single value from a cached analysis, or None if not available."""
-    arr = results.get(name)
-    if arr is None:
-        return None
-    return arr[frame]
-
-
-def format_value(value, unit=""):
+def show_number(value, unit=""):
+    """Format one number for the page, or say so if we do not have it."""
     if value is None or not np.isfinite(value):
         return "Not available"
-    return f"{value:.2f} {unit}".strip()
+    return "%.2f %s" % (value, unit)
 
 
-def format_com(com):
+def value_at_frame(results, name, frame):
+    """One value of one measurement at one frame."""
+    if results[name] is None:
+        return None
+    return results[name][frame]
+
+
+def average_over_range(results, name, start, end, unit=""):
+    """Average of one measurement over the frames the user selected."""
+    if results[name] is None:
+        return "Not available"
+    return show_number(results[name][start:end + 1].mean(), unit)
+
+
+def show_center_of_mass(com):
     if com is None:
         return "Not available"
-    x, y, z = com
-    return f"({x:.1f}, {y:.1f}, {z:.1f}) Å"
+    return "(%.1f, %.1f, %.1f) A" % (com[0], com[1], com[2])
 
 
-def format_secondary(dssp, frame):
+def show_secondary_structure(dssp, frame):
     if dssp is None:
         return "Not available"
-    helix, sheet, coil = summarize_secondary_structure(dssp[frame])
-    return (
-        f"- H (helix): {helix:.0f}%\n"
-        f"- S (strand): {sheet:.0f}%\n"
-        f"- C (coil): {coil:.0f}%"
-    )
+    helix, sheet, coil = analysis.summarize(dssp[frame])
+    return "- Helix: %.0f%%\n- Sheet: %.0f%%\n- Coil: %.0f%%" % (helix, sheet, coil)
 
 
-def range_value(results, name, start, end, stat, unit=""):
-    """Mean/min/max of a cached analysis over the frames start..end."""
-    arr = results.get(name)
-    if arr is None:
-        return "Not available"
-    vals = arr[start:end + 1]
-    return format_value(getattr(np, stat)(vals), unit)
+def make_plot(system, results, frame, metric):
+    """Build the Plotly graph for whichever metric the user picked."""
+    frames = np.arange(system.n_frames)
 
-
-def build_figure(system, results, frame, metric):
-    """Plot of the selected metric; RMSD and Rg are per frame, RMSF per residue."""
+    # RMSF is different from the others, it is per residue and not per frame
     if metric == "RMSF":
-        rmsf = results["rmsf"]
-        fig = go.Figure(go.Bar(
-            x=np.arange(len(rmsf)),
-            y=rmsf,
-            hovertemplate="Residue %{x}<br>RMSF %{y:.2f} Å<extra></extra>",
-        ))
-        fig.update_layout(xaxis_title="Residue index", yaxis_title="RMSF (Å)", height=350)
-        return fig
+        figure = go.Figure(go.Bar(x=np.arange(len(results["rmsf"])), y=results["rmsf"]))
+        figure.update_layout(xaxis_title="Residue", yaxis_title="RMSF (A)", height=350)
+        return figure
 
+    # all three metrics under each other, for comparing them
     if metric == "All":
-        fig = make_subplots(rows=3, subplot_titles=("RMSD", "RMSF", "Rg"))
-        if results.get("rmsd") is not None:
-            fig.append_trace(go.Scatter(
-                x=np.arange(system.n_frames), y=results["rmsd"], mode="lines", name="RMSD"
-            ), 1, 1)
-        if results.get("rmsf") is not None:
-            fig.append_trace(go.Bar(
-                x=np.arange(len(results["rmsf"])), y=results["rmsf"], name="RMSF"
-            ), 2, 1)
-        if results.get("rg") is not None:
-            fig.append_trace(go.Scatter(
-                x=np.arange(system.n_frames), y=results["rg"], mode="lines", name="Rg"
-            ), 3, 1)
-        fig.update_layout(height=700)
-        return fig
+        figure = make_subplots(rows=3, subplot_titles=("RMSD", "RMSF", "Rg"))
+        if results["rmsd"] is not None:
+            figure.add_trace(go.Scatter(x=frames, y=results["rmsd"], name="RMSD"), row=1, col=1)
+        if results["rmsf"] is not None:
+            figure.add_trace(go.Bar(x=np.arange(len(results["rmsf"])), y=results["rmsf"], name="RMSF"), row=2, col=1)
+        if results["rg"] is not None:
+            figure.add_trace(go.Scatter(x=frames, y=results["rg"], name="Rg"), row=3, col=1)
+        figure.update_layout(height=700)
+        return figure
 
-    is_rmsd = metric == "RMSD"
-    name = "RMSD" if is_rmsd else "Rg"
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=np.arange(system.n_frames),
-        y=results["rmsd"] if is_rmsd else results["rg"],
-        mode="lines",
-        name=name,
-        customdata=np.stack([system.time], axis=1),
-        hovertemplate="Frame %{x}<br>Time %{customdata[0]:.1f} ps<br>%{y:.2f} Å<extra></extra>",
-    ))
-    fig.add_vline(x=frame, line_color="red", line_dash="dash", opacity=0.6)
-    if st.session_state.get("selected_range"):
+    if metric == "RMSD":
+        values = results["rmsd"]
+    else:
+        values = results["rg"]
+
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(x=frames, y=values, mode="lines", name=metric))
+
+    # a red line showing which frame is on screen in the 3D viewer
+    figure.add_vline(x=frame, line_color="red", line_dash="dash", opacity=0.6)
+
+    # a shaded band if the user has selected a range of frames
+    if st.session_state["selected_range"] is not None:
         start, end = st.session_state["selected_range"]
-        fig.add_vrect(x0=start, x1=end, fillcolor="lightblue", opacity=0.2, line_width=0)
-    fig.update_layout(xaxis_title="Frame", yaxis_title=f"{name} (Å)", height=350)
-    return fig
+        figure.add_vrect(x0=start, x1=end, fillcolor="lightblue", opacity=0.2, line_width=0)
+
+    figure.update_layout(xaxis_title="Frame", yaxis_title=metric + " (A)", height=350)
+    return figure
 
 
-def handle_selection(event, n_frames):
-    """React to clicks / box selections on the trajectory graph."""
+def handle_click(event, n_frames):
+    """React when the user clicks a point or drags a box on the graph.
+
+    Clicking one point jumps the 3D viewer to that frame. Dragging a box over
+    several points selects that whole range of frames.
+    """
     if event is None:
         return
-    points = (event.selection or {}).get("points", [])
-    if not points:
+
+    points = event.selection["points"]
+    if len(points) == 0:
         return
 
-    indices = sorted({int(p.get("point_index", p.get("x", 0))) for p in points})
-    if len(indices) == 1:
-        st.session_state["frame"] = min(indices[0], n_frames - 1)
+    # the frame number is the x value of the point that was clicked
+    clicked = sorted(set(int(point["x"]) for point in points))
+
+    # Streamlit does not allow us to change the slider once it has been drawn,
+    # and by now it already has been. So we save the new frame number under a
+    # different name and main() picks it up at the start of the next run.
+    if len(clicked) == 1:
+        st.session_state["new_frame"] = min(clicked[0], n_frames - 1)
         st.session_state["selected_range"] = None
     else:
-        st.session_state["selected_range"] = (indices[0], indices[-1])
-        st.session_state["frame"] = indices[0]
+        st.session_state["selected_range"] = (clicked[0], clicked[-1])
+        st.session_state["new_frame"] = clicked[0]
+
     st.rerun()
 
 
 def main():
-    st.title("🧬 MolNumPy")
-    st.caption("Molecular Dynamics Explorer")
+    st.title("MolNumPy")
+    st.caption("Molecular dynamics trajectory explorer")
 
+    # --- the sidebar, where the files are uploaded ---
     with st.sidebar:
         st.header("Files")
         top_file = st.file_uploader(
             "Topology file (PDB, PSF, GRO, TPR, PRMTOP)",
-            type=[e.lstrip('.') for e in TOP_EXTENSIONS],
+            type=[extension[1:] for extension in TOPOLOGY_FORMATS],
         )
         traj_file = st.file_uploader(
             "Trajectory file (DCD, XTC, TRR, NC)",
-            type=[e.lstrip('.') for e in TRAJ_EXTENSIONS],
+            type=[extension[1:] for extension in TRAJECTORY_FORMATS],
         )
-        load_clicked = st.button("Load Simulation", width="stretch")
+        load_clicked = st.button("Load simulation")
 
     if load_clicked:
-        top_path = save_uploaded_file(top_file) if top_file else None
-        traj_path = save_uploaded_file(traj_file) if traj_file else None
+        top_path = None
+        traj_path = None
+        if top_file is not None:
+            top_path = save_upload(top_file)
+        if traj_file is not None:
+            traj_path = save_upload(traj_file)
+
         try:
-            with st.spinner("Loading files and computing analyses..."):
-                system, results = load_and_analyze_v2(top_path, traj_path)
+            with st.spinner("Reading the files and running the analysis..."):
+                system = load_simulation(top_path, traj_path)
+                results = run_all_analysis(system)
+
+            # session_state is how Streamlit remembers things between clicks.
+            # Without it everything would be recalculated every time the user
+            # moves the slider, which would be far too slow.
             st.session_state["system"] = system
             st.session_state["results"] = results
             st.session_state["frame"] = 0
             st.session_state["selected_range"] = None
             st.session_state["playing"] = False
-        except ValueError as e:
-            st.error(str(e))
+        except ValueError as error:
+            st.error(str(error))
 
+    # nothing loaded yet, so there is nothing else to draw
     if "system" not in st.session_state:
-        st.info("Upload a topology (and trajectory) file, then click **Load Simulation**.")
+        st.info("Upload a topology file (and a trajectory file) and click **Load simulation**.")
         return
 
     system = st.session_state["system"]
     results = st.session_state["results"]
-    n_frames = system.n_frames
 
-    # Frame playback: advance the frame and re-render the page
-    if st.session_state.get("playing") and st.session_state.get("selected_range"):
+    # a frame was picked on the graph during the last run, apply it now while
+    # the slider has not been drawn yet
+    if "new_frame" in st.session_state:
+        st.session_state["frame"] = st.session_state.pop("new_frame")
+
+    # --- the animation: move on one frame and redraw the page ---
+    if st.session_state["playing"] and st.session_state["selected_range"] is not None:
         start, end = st.session_state["selected_range"]
         next_frame = st.session_state["frame"] + 1
         if next_frame > end or next_frame < start:
-            next_frame = start
+            next_frame = start          # go back to the start of the range
         st.session_state["frame"] = next_frame
         time.sleep(0.1)
         st.rerun()
 
     frame = st.session_state["frame"]
 
+    # --- what was loaded ---
     st.subheader("Simulation information")
-    n_residues = len(np.unique(system.topology.atoms["resid"]))
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Number of atoms", f"{system.n_atoms:,}")
-    c2.metric("Number of residues", f"{n_residues:,}")
-    c3.metric("Number of frames", f"{n_frames:,}")
-    c4.metric("Simulation time", f"{system.time[-1]:.1f} ps")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Atoms", "{:,}".format(system.n_atoms))
+    col2.metric("Residues", "{:,}".format(system.n_residues))
+    col3.metric("Frames", "{:,}".format(system.n_frames))
+    col4.metric("Length", "%.1f ps" % system.time[-1])
 
-    st.subheader("3D protein structure")
-    st.caption(f"Frame {frame} | time {system.time[frame]:.1f} ps")
-    render_molecular_viewer(system, frame, width=900, height=520)
-    st.slider("Frame", min_value=0, max_value=n_frames - 1, key="frame")
+    # --- the 3D view ---
+    st.subheader("3D structure")
+    st.caption("Frame %d, at %.1f ps" % (frame, system.time[frame]))
+    show_structure(system, frame)
+    st.slider("Frame", min_value=0, max_value=system.n_frames - 1, key="frame")
 
+    # --- the graph ---
     st.subheader("Trajectory analysis")
-    metrics = {"RMSD": results.get("rmsd"), "RMSF": results.get("rmsf"), "Rg": results.get("rg")}
-    options = [name for name, arr in metrics.items() if arr is not None]
-    if not options:
-        st.info("RMSD, RMSF and Rg are not available for this system.")
+    choices = []
+    for name, label in [("rmsd", "RMSD"), ("rmsf", "RMSF"), ("rg", "Rg")]:
+        if results[name] is not None:
+            choices.append(label)
+
+    if len(choices) == 0:
+        st.info("None of the graphs could be calculated for this file.")
     else:
-        options.append("All")
-        metric = st.radio("Metric", options, horizontal=True)
-        fig = build_figure(system, results, frame, metric)
-        if metric in ("RMSD", "Rg"):
+        choices.append("All")
+        metric = st.radio("Metric", choices, horizontal=True)
+        figure = make_plot(system, results, frame, metric)
+
+        # the RMSD and Rg graphs can be clicked to change the frame
+        if metric == "RMSD" or metric == "Rg":
             event = st.plotly_chart(
-                fig,
+                figure,
                 on_select="rerun",
                 selection_mode=["points", "box", "lasso"],
-                key="main_plot",
+                key="graph",
             )
-            handle_selection(event, n_frames)
+            handle_click(event, system.n_frames)
         else:
-            st.plotly_chart(fig, key="main_plot")
+            st.plotly_chart(figure, key="graph")
 
-    st.subheader("Selected frame")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Frame", frame)
-    m1.metric("Time", f"{system.time[frame]:.1f} ps")
-    m2.metric("RMSD", format_value(frame_value(results, "rmsd", frame), "Å"))
-    m2.metric("Radius of gyration", format_value(frame_value(results, "rg", frame), "Å"))
-    m3.metric("SASA", format_value(frame_value(results, "sasa", frame), "Å²"))
-    m3.metric("H-bonds", format_value(frame_value(results, "hbonds", frame)))
-    m4.metric("Center of mass", format_com(frame_value(results, "com", frame)))
-    m4.markdown("**Secondary structure**")
-    m4.markdown(format_secondary(results.get("secondary"), frame))
+    # --- the numbers for the frame that is on screen ---
+    st.subheader("This frame")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Frame", frame)
+    col1.metric("Time", "%.1f ps" % system.time[frame])
+    col2.metric("RMSD", show_number(value_at_frame(results, "rmsd", frame), "A"))
+    col2.metric("Radius of gyration", show_number(value_at_frame(results, "rg", frame), "A"))
+    col3.metric("SASA", show_number(value_at_frame(results, "sasa", frame), "A2"))
+    col3.metric("Hydrogen bonds", show_number(value_at_frame(results, "hbonds", frame)))
+    col4.metric("Centre of mass", show_center_of_mass(value_at_frame(results, "com", frame)))
+    col4.markdown("**Secondary structure**")
+    col4.markdown(show_secondary_structure(results["secondary"], frame))
 
-    st.subheader("Selected frame range")
-    if st.session_state.get("selected_range"):
-        start, end = st.session_state["selected_range"]
-        st.caption(f"Frames {start} - {end}  ({end - start + 1} frames)")
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Average RMSD", range_value(results, "rmsd", start, end, "mean", "Å"))
-        r2.metric("Average Rg", range_value(results, "rg", start, end, "mean", "Å"))
-        r3.metric("Average SASA", range_value(results, "sasa", start, end, "mean", "Å²"))
-        r4.metric("Average H-bonds", range_value(results, "hbonds", start, end, "mean"))
-        r1.metric("Minimum RMSD", range_value(results, "rmsd", start, end, "min", "Å"))
-        r2.metric("Maximum RMSD", range_value(results, "rmsd", start, end, "max", "Å"))
+    # --- the numbers for a whole range of frames ---
+    st.subheader("Selected frames")
+    if st.session_state["selected_range"] is None:
+        st.info("Drag a box across the RMSD or Rg graph to select a range of frames.")
+        return
 
-        if st.button("▶ Play selected frames"):
-            st.session_state["playing"] = True
-        if st.session_state.get("playing"):
-            if st.button("⏹ Stop"):
-                st.session_state["playing"] = False
-    else:
-        st.info("Draw a box on the RMSD graph to select a range of frames.")
+    start, end = st.session_state["selected_range"]
+    st.caption("Frames %d to %d (%d frames)" % (start, end, end - start + 1))
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Average RMSD", average_over_range(results, "rmsd", start, end, "A"))
+    col2.metric("Average Rg", average_over_range(results, "rg", start, end, "A"))
+    col3.metric("Average SASA", average_over_range(results, "sasa", start, end, "A2"))
+    col4.metric("Average hydrogen bonds", average_over_range(results, "hbonds", start, end))
+
+    if results["rmsd"] is not None:
+        col1.metric("Lowest RMSD", show_number(results["rmsd"][start:end + 1].min(), "A"))
+        col2.metric("Highest RMSD", show_number(results["rmsd"][start:end + 1].max(), "A"))
+
+    # --- playing the selected frames like a video ---
+    if st.button("Play these frames"):
+        st.session_state["playing"] = True
+    if st.session_state["playing"]:
+        if st.button("Stop"):
+            st.session_state["playing"] = False
 
 
-if __name__ == "__main__":
-    main()
+main()

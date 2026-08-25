@@ -1,102 +1,102 @@
-# 🧬 MDExplorer: Interactive Molecular Dynamics Trajectory Explorer
+# MolNumPy
 
-MDExplorer converts molecular dynamics (MD) simulation files of different formats into **one common NumPy-based representation**, allowing you to view and interact with the molecular trajectory in 3D while analyzing key biophysical metrics in real time.
+A tool for exploring molecular dynamics (MD) simulations in the browser. You
+upload the files from your simulation, and it shows the protein in 3D together
+with graphs of the usual analysis measurements.
 
----
+## The idea behind it
 
-## 🌟 Key Features
+MD simulations are saved in a lot of different file formats, and every format
+stores the same information in a different way. Normally that means writing
+separate code for each one.
 
-*   **Format Agnostic**: Automatically parses and converts files of different formats (PDB, PSF+DCD, GRO+XTC, TPR+XTC, PRMTOP+NC) into a single unified `MolecularSystem` object containing pure NumPy arrays.
-*   **3D Trajectory Viewer**: Renders the protein structure in 3D using `py3Dmol` cartoon/stick styles with dynamic frame navigation.
-*   **Interactive Digital Cockpit**: Featuring Plotly charts linked directly to the 3D viewer. Clicking any point on the chart snaps the 3D model to that frame.
-*   **Scientifically Validated Trajectory Metrics**:
-    *   **Backbone RMSD**: Computes structural displacement over time relative to the reference frame. Uses the **Kabsch algorithm** to superimpose structures and remove translational/rotational diffusion.
-    *   **Radius of Gyration ($R_g$)**: Measures overall shape compactness by computing the root-mean-square distance of atoms from their center of geometry.
-    *   **Hydrogen Bonds**: Computes intramolecular polar-pair contacts (donor/acceptor N, O) within a $3.5\text{ Å}$ distance cutoff using SciPy's vectorized `cdist`.
-    *   **SASA (Solvent Accessible Surface Area)**: Calculates exposed surface area using MDTraj's Shrake-Rupley algorithm.
-    *   **RMSF (Root Mean Square Fluctuation)**: Calculates the fluctuation profile per residue across the trajectory to identify highly mobile loops.
-    *   **DSSP Secondary Structure**: Computes Helix, Sheet, and Coil percentages per frame using MDTraj's DSSP module.
-*   **Solvent & Ion Filtering**: All metric calculations automatically exclude water and ion molecules (e.g. `HOH`, `WAT`, `NA`, `CL`), ensuring data is biologically accurate.
+This project avoids that. It reads the file once, copies everything into plain
+NumPy arrays inside a single `MolecularSystem` object, and then forgets where
+the data came from. All the analysis code and the 3D viewer only ever talk to
+that one object, so adding a new file format means changing only the reader.
 
----
-
-## 🛠️ Technology Stack
-
-1.  **Frontend/GUI**: Streamlit
-2.  **Interactive Plots**: Plotly
-3.  **Core Math & Distance Computations**: NumPy & SciPy
-4.  **Simulation Loading**: MDAnalysis
-5.  **Biophysical Analytics**: MDTraj (DSSP & SASA) & MDAnalysis (RMSD & RMSF)
-6.  **3D Rendering**: py3Dmol & stmol
-
----
-
-## 📂 Project Directory Structure
-
-```text
-MolNumPy/
-│
-├── app.py                     # Streamlit Main Dashboard Entrypoint
-├── requirements.txt           # Package Dependencies
-├── README.md                  # Project Documentation
-│
-├── src/molnumpy/              # Core Unified Data Representations
-│   ├── system.py              # MolecularSystem wrapper (Topology + Trajectory)
-│   ├── topology.py            # Static attributes (Atoms, residue indices, bonds)
-│   ├── trajectory.py          # Dynamic coordinates (n_frames, n_atoms, 3)
-│   │
-│   ├── readers/
-│   │   ├── factory.py         # Format detection and loader mappings
-│   │   └── reader.py          # low-level converters (MDAnalysis -> NumPy)
-│   │
-│   └── visualization/
-│       └── viewer.py          # 3D py3Dmol viewer string building
-│
-├── analysis/                  # Custom Trajectory Analyzers
-│   ├── com.py                 # Center of Mass Calculator
-│   ├── hbonds.py              # Hydrogen Bond calculator (polar name selection)
-│   ├── rg.py                  # Radius of Gyration calculator
-│   ├── rmsd.py                # Backbone RMSD (Kabsch aligned)
-│   ├── rmsf.py                # Per-residue fluctuation
-│   ├── sasa.py                # Solvent Accessible Surface Area (Shrake-Rupley)
-│   └── secondary.py           # DSSP Secondary Structure assignment
-│
-└── utils/
-    └── loader.py              # Wrappers and file loader helpers
+```
+   PDB                 |
+   PSF + DCD           |
+   GRO + XTC           |----> MolecularSystem ----> analysis + 3D viewer
+   TPR + XTC           |      (NumPy arrays)
+   PRMTOP + NC         |
 ```
 
----
+A `MolecularSystem` holds:
 
-## 🚀 Installation & Running
+* one array per atom property, which never changes: `names`, `resids`,
+  `resnames`, `elements`, `masses`
+* the coordinates, which do change, in one array of shape
+  `(n_frames, n_atoms, 3)`
+* the time of each frame
 
-### 1. Prerequisites
-Open your terminal and navigate to the project directory:
-```bash
-cd "c:\Users\rejoy\Desktop\BTP_1\MolNumPy"
+## What it measures
+
+Water molecules and ions are removed before every calculation, otherwise the
+solvent box around the protein would dominate the results.
+
+| Measurement | What it tells you | How it is done |
+| --- | --- | --- |
+| RMSD | how far the shape has moved from the starting structure | our own NumPy code, using the Kabsch algorithm to remove the tumbling of the molecule |
+| RMSF | which residues are flexible and which are rigid | our own NumPy code, one value per alpha carbon |
+| Radius of gyration | how compact the folded protein is | our own NumPy code, mass weighted |
+| Centre of mass | whether the protein is drifting through the box | our own NumPy code |
+| Hydrogen bonds | whether the folded structure is holding together | our own NumPy code, the Baker-Hubbard geometric rule: H...acceptor under 2.5 A and a donor-H...acceptor angle over 120 degrees |
+| SASA | how much surface is exposed to water | mdtraj (Shrake-Rupley) |
+| Secondary structure | the helix / sheet / coil percentages | mdtraj (DSSP) |
+
+The last two use a library because the algorithms behind them are much bigger
+than the rest. Everything else is calculated directly from the NumPy arrays.
+
+## What the page does
+
+* the protein is drawn in 3D with py3Dmol, and a slider moves through the frames
+* the graph can be clicked to jump the 3D view to that frame
+* dragging a box across the graph selects a range of frames, and the averages
+  over that range are shown underneath
+* a selected range can be played back like a short video
+
+## Libraries used
+
+| Library | Used for |
+| --- | --- |
+| MDAnalysis | opening the simulation files |
+| NumPy | all the arrays and most of the maths |
+| SciPy | distances between atoms, for the hydrogen bonds |
+| mdtraj | SASA and DSSP |
+| Streamlit | the web page |
+| Plotly | the graphs |
+| py3Dmol, stmol | the 3D view |
+
+## Files
+
+There are only four of them:
+
+```
+molecule.py    the MolecularSystem class, and reading a file into one
+analysis.py    all seven measurements
+viewer.py      writes a frame as PDB text and draws it in 3D
+app.py         the Streamlit page, this is what you run
 ```
 
-### 2. Activate Virtual Environment
-Activate the pre-configured virtual environment:
-```bash
-# Windows PowerShell
-.venv\Scripts\activate
-```
+## Running it
 
-### 3. Install Dependencies
-```bash
+Install the requirements once:
+
+```
 pip install -r requirements.txt
 ```
 
-### 4. Run the Dashboard
-```bash
+Then start the app:
+
+```
 streamlit run app.py
 ```
-Streamlit will launch a local server and open `http://localhost:8501` in your browser.
 
----
+It opens at `http://localhost:8501`.
 
-## 📊 Trajectory Upload Guide
-
-1.  **Topology File**: Upload your structure file (PDB, PSF, GRO, TPR, PRMTOP).
-2.  **Trajectory File**: Upload your coordinate file (DCD, XTC, TRR, NC). Note: Single `.pdb` files contain both structure and single-frame coordinates, and do not require a separate trajectory file.
-3.  Click **Load Simulation** to process the data and open the interactive digital cockpit!
+Upload the topology file first (PDB, PSF, GRO, TPR or PRMTOP), then the
+trajectory file (DCD, XTC, TRR or NC), and click **Load simulation**. A plain
+`.pdb` file already contains coordinates, so for that one no trajectory file is
+needed.
