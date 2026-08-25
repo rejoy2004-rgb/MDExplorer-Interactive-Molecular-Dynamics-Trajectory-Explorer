@@ -121,7 +121,12 @@ def make_plot(system, results, frame, metric):
         values = results["rg"]
 
     figure = go.Figure()
-    figure.add_trace(go.Scatter(x=frames, y=values, mode="lines", name=metric))
+    figure.add_trace(go.Scatter(
+        x=frames, y=values, mode="lines+markers", name=metric,
+        # small, near-invisible markers give the click and box select
+        # something to grab onto - a plain line has nothing to click on
+        marker=dict(size=5, opacity=0.15),
+    ))
 
     # a red line showing which frame is on screen in the 3D viewer
     figure.add_vline(x=frame, line_color="red", line_dash="dash", opacity=0.6)
@@ -260,6 +265,9 @@ def main():
 
         # the RMSD and Rg graphs can be clicked to change the frame
         if metric == "RMSD" or metric == "Rg":
+            st.caption("Click a point to jump to that frame. To select a range, "
+                       "pick the box select tool (dashed square) in the chart's "
+                       "toolbar first, then drag across the graph.")
             event = st.plotly_chart(
                 figure,
                 on_select="rerun",
