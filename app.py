@@ -5,7 +5,6 @@ Start it from the terminal with:   streamlit run app.py
 
 import os
 import tempfile
-import time
 
 import numpy as np
 import plotly.graph_objects as go
@@ -20,10 +19,7 @@ st.set_page_config(page_title="MolNumPy", layout="wide")
 
 
 def save_upload(uploaded_file):
-    """Streamlit keeps uploads in memory, but the readers need a real file.
-
-    So we write the upload into a temporary file and return its path.
-    """
+    """Save an upload to a temp file and return its path (readers need a real file)."""
     extension = os.path.splitext(uploaded_file.name)[1]
     handle, path = tempfile.mkstemp(suffix=extension)
     with os.fdopen(handle, "wb") as f:
@@ -32,13 +28,7 @@ def save_upload(uploaded_file):
 
 
 def run_all_analysis(system):
-    """Run every measurement once, right after the files are loaded.
-
-    Not every measurement works on every file. DSSP for example needs a proper
-    protein and fails on a small molecule. So each one is run on its own, and
-    if it fails we store None and the page shows "Not available" instead of the
-    whole program crashing.
-    """
+    """Run every measurement; store None (shown as "Not available") if one fails."""
     to_run = {
         "rmsd": analysis.calculate_rmsd,
         "rmsf": analysis.calculate_rmsf,
@@ -77,7 +67,8 @@ def average_over_range(results, name, start, end, unit=""):
     """Average of one measurement over the frames the user selected."""
     if results[name] is None:
         return "Not available"
-    return show_number(results[name][start:end + 1].mean(), unit)
+    values = results[name][start:end + 1]
+    return show_number(sum(values) / len(values), unit)
 
 
 def show_center_of_mass(com):
@@ -123,8 +114,7 @@ def make_plot(system, results, frame, metric):
     figure = go.Figure()
     figure.add_trace(go.Scatter(
         x=frames, y=values, mode="lines+markers", name=metric,
-        # small, near-invisible markers give the click and box select
-        # something to grab onto - a plain line has nothing to click on
+        # markers give clicks something to hit; a plain line has no target
         marker=dict(size=5, opacity=0.15),
     ))
 
@@ -141,11 +131,7 @@ def make_plot(system, results, frame, metric):
 
 
 def handle_click(event, n_frames):
-    """React when the user clicks a point or drags a box on the graph.
-
-    Clicking one point jumps the 3D viewer to that frame. Dragging a box over
-    several points selects that whole range of frames.
-    """
+    """Jump to the clicked frame, or select a dragged range."""
     if event is None:
         return
 
@@ -156,9 +142,7 @@ def handle_click(event, n_frames):
     # the frame number is the x value of the point that was clicked
     clicked = sorted(set(int(point["x"]) for point in points))
 
-    # Streamlit does not allow us to change the slider once it has been drawn,
-    # and by now it already has been. So we save the new frame number under a
-    # different name and main() picks it up at the start of the next run.
+    # slider's already drawn this run, so stash the value for next run
     if len(clicked) == 1:
         st.session_state["new_frame"] = min(clicked[0], n_frames - 1)
         st.session_state["selected_range"] = None
@@ -199,14 +183,11 @@ def main():
                 system = load_simulation(top_path, traj_path)
                 results = run_all_analysis(system)
 
-            # session_state is how Streamlit remembers things between clicks.
-            # Without it everything would be recalculated every time the user
-            # moves the slider, which would be far too slow.
+            # session_state survives reruns, so we don't reload on every click
             st.session_state["system"] = system
             st.session_state["results"] = results
             st.session_state["frame"] = 0
             st.session_state["selected_range"] = None
-            st.session_state["playing"] = False
         except ValueError as error:
             st.error(str(error))
 
@@ -218,20 +199,9 @@ def main():
     system = st.session_state["system"]
     results = st.session_state["results"]
 
-    # a frame was picked on the graph during the last run, apply it now while
-    # the slider has not been drawn yet
+    # apply a frame picked last run, before the slider is drawn
     if "new_frame" in st.session_state:
         st.session_state["frame"] = st.session_state.pop("new_frame")
-
-    # --- the animation: move on one frame and redraw the page ---
-    if st.session_state["playing"] and st.session_state["selected_range"] is not None:
-        start, end = st.session_state["selected_range"]
-        next_frame = st.session_state["frame"] + 1
-        if next_frame > end or next_frame < start:
-            next_frame = start          # go back to the start of the range
-        st.session_state["frame"] = next_frame
-        time.sleep(0.1)
-        st.rerun()
 
     frame = st.session_state["frame"]
 
@@ -307,15 +277,9 @@ def main():
     col4.metric("Average hydrogen bonds", average_over_range(results, "hbonds", start, end))
 
     if results["rmsd"] is not None:
-        col1.metric("Lowest RMSD", show_number(results["rmsd"][start:end + 1].min(), "A"))
-        col2.metric("Highest RMSD", show_number(results["rmsd"][start:end + 1].max(), "A"))
-
-    # --- playing the selected frames like a video ---
-    if st.button("Play these frames"):
-        st.session_state["playing"] = True
-    if st.session_state["playing"]:
-        if st.button("Stop"):
-            st.session_state["playing"] = False
+        rmsd_values = results["rmsd"][start:end + 1]
+        col1.metric("Lowest RMSD", show_number(min(rmsd_values), "A"))
+        col2.metric("Highest RMSD", show_number(max(rmsd_values), "A"))
 
 
 main()

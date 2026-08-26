@@ -1,231 +1,307 @@
-"""The measurements we take from a trajectory.
+"""Trajectory measurements: one value per frame (RMSF: per residue).
 
-Each function takes a MolecularSystem and gives back a NumPy array with one
-value per frame. RMSF is the exception: it gives one value per residue.
-
-Most of these are worked out directly from the NumPy coordinates. Only SASA and
-DSSP come from a library, because those two algorithms are far bigger than the
-rest. Water and ions are left out everywhere, otherwise the solvent box around
-the protein would dominate the results.
+Plain lists and loops throughout, except superimpose() which still uses
+NumPy's SVD once (real linear algebra, not reimplemented) and SASA/DSSP
+which still come from mdtraj (large, established algorithms). Water and
+ions are excluded everywhere.
 """
 
-import numpy as np
+import math
 import mdtraj as md
-from scipy.spatial.distance import cdist
+import numpy as np
 
 # the four atoms that make up the protein backbone
 BACKBONE = ["N", "CA", "C", "O"]
 
-# Angstrom, a typical N-H or O-H covalent bond length (used to work out which
-# heavy atom a hydrogen belongs to)
+# Angstrom; a covalent N-H or O-H bond is about this long
 BOND_LENGTH = 1.3
 
 # the Baker-Hubbard geometric criteria for a hydrogen bond
 HBOND_DIST = 2.5    # Angstrom, hydrogen to acceptor
-HBOND_ANGLE = 120    # degrees, donor-H...acceptor
+HBOND_ANGLE = 120   # degrees, donor-H...acceptor
 
 # DSSP uses eight letters, we group them into the three shapes people talk about
 HELIX = ["H", "G", "I"]
 SHEET = ["E", "B"]
 
 
+def frame_positions(system, frame_index, atom_indices):
+    """Plain [x, y, z] positions of the given atoms at one frame."""
+    points = []
+    for idx in atom_indices:
+        x, y, z = system.coordinates[frame_index][idx]
+        points.append([float(x), float(y), float(z)])
+    return points
+
+
+def mean_center(points):
+    """Move a list of points so their average position sits at the origin."""
+    n = len(points)
+    total = [0.0, 0.0, 0.0]
+    for p in points:
+        total[0] += p[0]
+        total[1] += p[1]
+        total[2] += p[2]
+    average = [total[0] / n, total[1] / n, total[2] / n]
+    return [[p[0] - average[0], p[1] - average[1], p[2] - average[2]] for p in points]
+
+
+def transpose3(m):
+    """Flip a 3x3 matrix's rows and columns."""
+    result = [[0.0, 0.0, 0.0] for _ in range(3)]
+    for i in range(3):
+        for j in range(3):
+            result[j][i] = m[i][j]
+    return result
+
+
+def matmul3(a, b):
+    """Multiply two 3x3 matrices."""
+    result = [[0.0, 0.0, 0.0] for _ in range(3)]
+    for i in range(3):
+        for j in range(3):
+            total = 0.0
+            for k in range(3):
+                total += a[i][k] * b[k][j]
+            result[i][j] = total
+    return result
+
+
+def determinant3(m):
+    """Determinant of a 3x3 matrix, using the standard formula."""
+    return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+
+
 def superimpose(mobile, reference):
-    """Rotate 'mobile' so it sits on top of 'reference' as well as possible.
+    """Rotate 'mobile' onto 'reference' (Kabsch algorithm), so RMSD measures
+    shape change, not tumbling. Both are point lists centred on the origin."""
+    n = len(mobile)
 
-    This is the Kabsch algorithm. We need it because a protein also floats and
-    spins around inside the water box during a simulation. Without this step
-    the RMSD would mostly measure that spinning instead of the change in shape.
+    # how the two sets of points vary together (a 3x3 matrix)
+    covariance = [[0.0, 0.0, 0.0] for _ in range(3)]
+    for a in range(3):
+        for b in range(3):
+            total = 0.0
+            for k in range(n):
+                total += mobile[k][a] * reference[k][b]
+            covariance[a][b] = total
 
-    Both inputs are (n_atoms, 3) arrays already moved to the origin.
-    """
-    # how the two sets of points vary together
-    covariance = np.dot(mobile.T, reference)
-
-    # the SVD of that matrix gives us the best rotation between the two sets
+    # SVD gives the best rotation; the one place we still need NumPy
     u, _, vt = np.linalg.svd(covariance)
+    u, vt = u.tolist(), vt.tolist()
 
-    # if the determinant is negative the SVD has given a mirror image instead
-    # of a rotation, and flipping the last column fixes it
-    d = np.sign(np.linalg.det(np.dot(vt.T, u.T)))
-    correction = np.diag([1.0, 1.0, d])
+    # a negative determinant means a mirror flip; fix it via the last column
+    vt_t = transpose3(vt)
+    u_t = transpose3(u)
+    d = 1.0 if determinant3(matmul3(vt_t, u_t)) >= 0 else -1.0
+    correction = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, d]]
 
-    rotation = np.dot(np.dot(vt.T, correction), u.T)
-    return np.dot(mobile, rotation.T)
+    rotation = matmul3(matmul3(vt_t, correction), u_t)
+
+    rotated = []
+    for point in mobile:
+        new_point = [0.0, 0.0, 0.0]
+        for j in range(3):
+            total = 0.0
+            for i in range(3):
+                total += point[i] * rotation[j][i]
+            new_point[j] = total
+        rotated.append(new_point)
+    return rotated
 
 
 def calculate_rmsd(system):
-    """RMSD of the protein backbone in Angstrom, one value per frame.
-
-    RMSD is Root Mean Square Deviation: how far the backbone atoms have moved
-    compared to the first frame. A flat curve means the protein is stable, a
-    rising curve means it is still changing shape.
-    """
-    atoms = system.select(BACKBONE)
+    """RMSD (Root Mean Square Deviation) of the backbone per frame, vs frame 0."""
+    atoms = system.select(BACKBONE).tolist()
     if len(atoms) == 0:
         raise ValueError("No protein backbone atoms were found in this file.")
 
     # the first frame is the reference that everything is compared against
-    reference = system.coordinates[0][atoms]
-    reference = reference - reference.mean(axis=0)      # move it to the origin
+    reference = mean_center(frame_positions(system, 0, atoms))
 
-    rmsd = np.zeros(system.n_frames)
-
+    rmsd = []
     for i in range(system.n_frames):
-        frame = system.coordinates[i][atoms]
-        frame = frame - frame.mean(axis=0)
+        frame = mean_center(frame_positions(system, i, atoms))
         frame = superimpose(frame, reference)
 
-        # square the distance between the two structures atom by atom,
-        # take the average, then the square root
-        difference = frame - reference
-        rmsd[i] = np.sqrt((difference ** 2).sum() / len(atoms))
+        # root mean square of the per-atom distance
+        total = 0.0
+        for a in range(len(atoms)):
+            dx = frame[a][0] - reference[a][0]
+            dy = frame[a][1] - reference[a][1]
+            dz = frame[a][2] - reference[a][2]
+            total += dx * dx + dy * dy + dz * dz
+        rmsd.append(math.sqrt(total / len(atoms)))
 
     return rmsd
 
 
 def calculate_rmsf(system):
-    """RMSF of every residue in Angstrom, measured at its alpha carbon.
-
-    RMSD gives one number for the whole protein at each moment in time. RMSF is
-    the other way round: one number per residue, averaged over the whole
-    simulation. The peaks are the flexible loops and the flat parts are the
-    rigid helices and sheets.
-    """
-    # one alpha carbon per residue, so we get one value per residue
-    atoms = system.select(["CA"])
+    """RMSF (fluctuation) of each residue's alpha carbon, over the whole simulation."""
+    atoms = system.select(["CA"]).tolist()
     if len(atoms) == 0:
         raise ValueError("No alpha carbon (CA) atoms were found in this file.")
 
-    # the frames have to be aligned first, exactly like in the RMSD, otherwise
-    # the movement of the whole protein would look like fluctuation
-    reference = system.coordinates[0][atoms]
-    reference = reference - reference.mean(axis=0)
+    # align first, like RMSD, so drift isn't mistaken for fluctuation
+    reference = mean_center(frame_positions(system, 0, atoms))
 
-    aligned = np.zeros((system.n_frames, len(atoms), 3))
+    aligned = []
     for i in range(system.n_frames):
-        frame = system.coordinates[i][atoms]
-        frame = frame - frame.mean(axis=0)
-        aligned[i] = superimpose(frame, reference)
+        frame = mean_center(frame_positions(system, i, atoms))
+        aligned.append(superimpose(frame, reference))
+
+    n_atoms = len(atoms)
+    n_frames = system.n_frames
 
     # the average position of each residue over the whole simulation
-    average = aligned.mean(axis=0)
+    average = []
+    for a in range(n_atoms):
+        total = [0.0, 0.0, 0.0]
+        for i in range(n_frames):
+            total[0] += aligned[i][a][0]
+            total[1] += aligned[i][a][1]
+            total[2] += aligned[i][a][2]
+        average.append([total[0] / n_frames, total[1] / n_frames, total[2] / n_frames])
 
     # how far each residue is from its own average position, on average
-    difference = aligned - average
-    squared = (difference ** 2).sum(axis=2)     # squared distance in each frame
-    return np.sqrt(squared.mean(axis=0))        # averaged over the frames
+    rmsf = []
+    for a in range(n_atoms):
+        total = 0.0
+        for i in range(n_frames):
+            dx = aligned[i][a][0] - average[a][0]
+            dy = aligned[i][a][1] - average[a][1]
+            dz = aligned[i][a][2] - average[a][2]
+            total += dx * dx + dy * dy + dz * dz
+        rmsf.append(math.sqrt(total / n_frames))
+
+    return rmsf
 
 
 def center_of_mass(system):
-    """Centre of mass (x, y, z) of the protein, one row per frame.
+    """Mass-weighted centre of mass of the protein, one [x, y, z] per frame."""
+    mask = system.protein_mask()
+    atoms = [i for i in range(system.n_atoms) if mask[i]]
+    masses = [float(system.masses[i]) for i in atoms]
+    total_mass = sum(masses)
 
-    This is the balance point of the molecule. It shows whether the protein is
-    drifting through the box, and the radius of gyration needs it as well.
-    """
-    atoms = np.where(system.protein_mask())[0]
-    masses = system.masses[atoms]
-
-    com = np.zeros((system.n_frames, 3))
-
+    com = []
     for i in range(system.n_frames):
-        # heavy atoms count more than light ones, so every coordinate is
-        # multiplied by the mass of its atom before we take the average
-        weighted = system.coordinates[i][atoms] * masses[:, np.newaxis]
-        com[i] = weighted.sum(axis=0) / masses.sum()
+        points = frame_positions(system, i, atoms)
+
+        # weight each atom's position by its mass
+        total = [0.0, 0.0, 0.0]
+        for a in range(len(atoms)):
+            total[0] += points[a][0] * masses[a]
+            total[1] += points[a][1] * masses[a]
+            total[2] += points[a][2] * masses[a]
+        com.append([total[0] / total_mass, total[1] / total_mass, total[2] / total_mass])
 
     return com
 
 
 def calculate_rg(system):
-    """Radius of gyration of the protein in Angstrom, one value per frame.
-
-    This is the average distance of the atoms from the centre of mass. A small
-    value means a compact, folded protein and a large value means an open one.
-    If Rg suddenly grows during a simulation, the protein is unfolding.
-    """
-    atoms = np.where(system.protein_mask())[0]
-    masses = system.masses[atoms]
+    """Radius of gyration (spread from the centre of mass) per frame."""
+    mask = system.protein_mask()
+    atoms = [i for i in range(system.n_atoms) if mask[i]]
+    masses = [float(system.masses[i]) for i in atoms]
+    total_mass = sum(masses)
     centres = center_of_mass(system)
 
-    rg = np.zeros(system.n_frames)
-
+    rg = []
     for i in range(system.n_frames):
-        # distance of every atom from the centre of mass of that same frame
-        distance = system.coordinates[i][atoms] - centres[i]
-        squared = (distance ** 2).sum(axis=1)
+        points = frame_positions(system, i, atoms)
 
-        # the mass weighted average of those distances, then the square root
-        rg[i] = np.sqrt((masses * squared).sum() / masses.sum())
+        # mass-weighted root-mean-square distance from the centre
+        total = 0.0
+        for a in range(len(atoms)):
+            dx = points[a][0] - centres[i][0]
+            dy = points[a][1] - centres[i][1]
+            dz = points[a][2] - centres[i][2]
+            total += masses[a] * (dx * dx + dy * dy + dz * dz)
+        rg.append(math.sqrt(total / total_mass))
 
     return rg
 
 
 def calculate_hbonds(system):
-    """Number of hydrogen bonds inside the protein, one value per frame.
-
-    Hydrogen bonds are what hold a folded protein together, so counting them
-    frame by frame shows whether the structure is staying stable.
-
-    A hydrogen bond is a donor N-H or O-H pointing at an acceptor N or O on a
-    different part of the chain. We use the Baker-Hubbard geometric definition
-    (Baker & Hubbard, 1984): the distance from the hydrogen to the acceptor
-    must be under 2.5 A, and the donor-H...acceptor angle must be over 120
-    degrees. This needs the actual hydrogen atoms, which is why it only works
-    on files that include them (most MD trajectories do, X-ray PDB files often
-    do not).
-    """
-    protein = system.protein_mask()
-    heavy = np.where(protein & np.isin(system.elements, ["N", "O"]))[0]
-    hydrogens = np.where(protein & (system.elements == "H"))[0]
+    """Hydrogen bond count per frame: the Baker-Hubbard rule (H-acceptor
+    under 2.5 A, donor-H-acceptor angle over 120 deg). Needs real H atoms."""
+    mask = system.protein_mask()
+    heavy = [i for i in range(system.n_atoms) if mask[i] and system.elements[i] in ("N", "O")]
+    hydrogens = [i for i in range(system.n_atoms) if mask[i] and system.elements[i] == "H"]
     if len(heavy) == 0 or len(hydrogens) == 0:
         raise ValueError("No N-H or O-H donors were found in this file.")
 
-    # Work out which heavy atom each hydrogen is bonded to. We do this once,
-    # from the first frame, by finding its nearest N or O: an N-H or O-H bond
-    # is only about 1 A long, much shorter than any hydrogen bond.
-    first_frame = system.coordinates[0]
-    distance_to_heavy = cdist(first_frame[hydrogens], first_frame[heavy])
-    nearest_heavy = distance_to_heavy.argmin(axis=1)
-    is_bonded = distance_to_heavy.min(axis=1) < BOND_LENGTH
+    # find each hydrogen's own heavy atom once, from frame 0
+    hydrogen_points = frame_positions(system, 0, hydrogens)
+    heavy_points = frame_positions(system, 0, heavy)
 
-    donor_h = hydrogens[is_bonded]
-    donor_heavy = heavy[nearest_heavy[is_bonded]]
+    donor_h = []
+    donor_heavy = []
+    for h in range(len(hydrogens)):
+        nearest_distance = None
+        nearest_heavy = None
+        for a in range(len(heavy)):
+            dx = hydrogen_points[h][0] - heavy_points[a][0]
+            dy = hydrogen_points[h][1] - heavy_points[a][1]
+            dz = hydrogen_points[h][2] - heavy_points[a][2]
+            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if nearest_distance is None or distance < nearest_distance:
+                nearest_distance = distance
+                nearest_heavy = heavy[a]
+
+        if nearest_distance < BOND_LENGTH:
+            donor_h.append(hydrogens[h])
+            donor_heavy.append(nearest_heavy)
+
     if len(donor_h) == 0:
         raise ValueError("Could not find any bonded N-H or O-H pairs.")
 
-    counts = np.zeros(system.n_frames)
-
+    counts = []
     for i in range(system.n_frames):
-        h_pos = system.coordinates[i][donor_h]
-        donor_pos = system.coordinates[i][donor_heavy]
-        acceptor_pos = system.coordinates[i][heavy]
+        h_points = frame_positions(system, i, donor_h)
+        donor_points = frame_positions(system, i, donor_heavy)
+        acceptor_points = frame_positions(system, i, heavy)
 
-        h_to_acceptor = cdist(h_pos, acceptor_pos)
+        count = 0
+        for d in range(len(donor_h)):
+            # direction from H to its donor, normalised (must point away from H)
+            bx = donor_points[d][0] - h_points[d][0]
+            by = donor_points[d][1] - h_points[d][1]
+            bz = donor_points[d][2] - h_points[d][2]
+            bond_length = math.sqrt(bx * bx + by * by + bz * bz)
+            bx, by, bz = bx / bond_length, by / bond_length, bz / bond_length
 
-        # the angle at the hydrogen, between its own bond and the line to
-        # each candidate acceptor
-        donor_to_h = donor_pos - h_pos
-        donor_to_h = donor_to_h / np.linalg.norm(donor_to_h, axis=1, keepdims=True)
-        h_to_a_vec = acceptor_pos[np.newaxis, :, :] - h_pos[:, np.newaxis, :]
-        h_to_a_vec = h_to_a_vec / np.linalg.norm(h_to_a_vec, axis=2, keepdims=True)
-        cos_angle = np.einsum("ij,ikj->ik", donor_to_h, h_to_a_vec)
-        angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+            for a in range(len(heavy)):
+                # a hydrogen cannot form a bond back to its own heavy atom
+                if heavy[a] == donor_heavy[d]:
+                    continue
 
-        # a hydrogen cannot form a bond back to its own heavy atom
-        own_donor = donor_heavy[:, np.newaxis] == heavy[np.newaxis, :]
+                ax = acceptor_points[a][0] - h_points[d][0]
+                ay = acceptor_points[a][1] - h_points[d][1]
+                az = acceptor_points[a][2] - h_points[d][2]
+                distance = math.sqrt(ax * ax + ay * ay + az * az)
+                if distance >= HBOND_DIST:
+                    continue
 
-        is_hbond = (h_to_acceptor < HBOND_DIST) & (angle > HBOND_ANGLE) & (~own_donor)
-        counts[i] = np.count_nonzero(is_hbond)
+                # angle at H between its own bond and the line to this acceptor
+                ax, ay, az = ax / distance, ay / distance, az / distance
+                cos_angle = bx * ax + by * ay + bz * az
+                cos_angle = max(-1.0, min(1.0, cos_angle))
+                angle = math.degrees(math.acos(cos_angle))
+
+                if angle > HBOND_ANGLE:
+                    count += 1
+
+        counts.append(count)
 
     return counts
 
 
 def mdtraj_protein(system):
-    """Open the files again with mdtraj and keep only the protein.
-
-    SASA and DSSP both need this, and reading a large trajectory twice is slow,
-    so the result is stored on the system the first time and reused after that.
-    """
+    """Reopen the file with mdtraj (cached), keeping only the protein."""
     if system.mdtraj_protein is None:
         if system.traj_path is None:
             traj = md.load(system.top_path)
@@ -237,39 +313,22 @@ def mdtraj_protein(system):
 
 
 def calculate_sasa(system):
-    """Total SASA of the protein in square Angstrom, one value per frame.
+    """Total solvent accessible surface area per frame (mdtraj's Shrake-Rupley)."""
+    # per-atom area, converted to a plain list
+    per_atom = md.shrake_rupley(mdtraj_protein(system)).tolist()
 
-    SASA is the area of the surface that water can reach. A folded protein
-    hides most of its atoms inside so its SASA is small, and when it unfolds
-    more is exposed and the SASA goes up.
-
-    The standard method is the Shrake-Rupley algorithm, which rolls a water
-    sized ball over the surface. That is a lot to write from scratch, so this
-    is one of the two measurements we take from a library.
-    """
-    # one area value per atom per frame
-    sasa = md.shrake_rupley(mdtraj_protein(system))
-
-    # add up the atoms to get the area of the whole protein. mdtraj works in
-    # nanometres and 1 nm2 is 100 A2, so we convert at the same time.
-    return sasa.sum(axis=1) * 100
+    # sum per atom; convert mdtraj's nm2 to A2
+    return [sum(frame) * 100 for frame in per_atom]
 
 
 def calculate_secondary_structure(system):
-    """DSSP letter for every residue in every frame.
-
-    DSSP is the standard way of deciding which shape each residue is in. It
-    looks at the hydrogen bonding pattern of the backbone and gives every
-    residue a letter. The result has one row per frame and one column per
-    residue. Like SASA, this comes from mdtraj.
-    """
-    return md.compute_dssp(mdtraj_protein(system))
+    """DSSP letter per residue per frame (mdtraj)."""
+    return md.compute_dssp(mdtraj_protein(system)).tolist()
 
 
 def summarize(codes):
     """Turn the DSSP letters of one frame into helix %, sheet % and coil %."""
-    # the residues at the two ends of a chain often cannot be assigned,
-    # DSSP marks those as "NA" and we leave them out
+    # DSSP marks unassignable ends as "NA"; skip them
     assigned = [code for code in codes if code != "NA"]
     if len(assigned) == 0:
         return 0.0, 0.0, 0.0

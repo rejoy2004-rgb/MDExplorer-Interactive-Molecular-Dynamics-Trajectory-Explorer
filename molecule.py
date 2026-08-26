@@ -1,11 +1,4 @@
-"""Reading a simulation and holding it in one common format.
-
-MD simulations are saved in many different file formats, and each one stores
-the same information in its own way. Instead of writing separate code for every
-format, we read the file once with MDAnalysis and copy everything into plain
-NumPy arrays inside a MolecularSystem object. After that the rest of the
-program never has to know which format we started from.
-"""
+"""Reads any supported simulation file into one common MolecularSystem."""
 
 import os
 
@@ -16,19 +9,13 @@ import MDAnalysis as mda
 TOPOLOGY_FORMATS = [".pdb", ".psf", ".gro", ".tpr", ".prmtop", ".parm7"]
 TRAJECTORY_FORMATS = [".dcd", ".xtc", ".trr", ".nc"]
 
-# Residue names for water and simple ions. These are part of the simulation box
-# but not part of the protein, so we leave them out of the calculations.
+# water and ion residue names, left out of every calculation
 SOLVENT = ["HOH", "WAT", "SOL", "TIP3", "SPC", "NA", "CL", "K", "MG",
            "ZN", "SOD", "CLA", "POT", "ION"]
 
 
 class MolecularSystem:
-    """One simulation, stored as plain NumPy arrays.
-
-    The arrays that describe the atoms have one entry per atom and never
-    change. The coordinates do change, so they have an extra dimension at the
-    front for the frame number.
-    """
+    """One simulation, stored as plain NumPy arrays: atom info + per-frame coordinates."""
 
     def __init__(self, universe, top_path, traj_path):
         self.n_atoms = len(universe.atoms)
@@ -40,18 +27,17 @@ class MolecularSystem:
         self.resnames = np.array(universe.atoms.resnames)
         self.elements = np.array([guess_element(name) for name in self.names])
 
-        try:
+        # a few file formats simply do not have mass information at all
+        if hasattr(universe.atoms, "masses"):
             self.masses = np.array(universe.atoms.masses, dtype=float)
-        except Exception:
+        else:
             self.masses = np.zeros(self.n_atoms)
 
-        # a few formats do not store the masses at all, then we give every atom
-        # the same weight so the centre of mass and Rg still make sense
+        # if no format gave us masses, treat every atom as equal weight
         if self.masses.sum() == 0:
             self.masses = np.ones(self.n_atoms)
 
-        # the coordinates, which are different in every frame.
-        # float32 is accurate enough here and uses half the memory of float64.
+        # float32 is accurate enough here and halves the memory of float64
         self.coordinates = np.zeros((self.n_frames, self.n_atoms, 3), dtype=np.float32)
         self.time = np.zeros(self.n_frames)
 
@@ -59,38 +45,25 @@ class MolecularSystem:
             self.coordinates[i] = universe.atoms.positions
             self.time[i] = frame.time
 
-        # count the protein residues only, otherwise a simulation with a big
-        # water box would report tens of thousands of "residues"
+        # protein residues only, otherwise water would inflate this count
         self.n_residues = len(np.unique(self.resids[self.protein_mask()]))
 
-        # SASA and DSSP open the files a second time with mdtraj, so we keep
-        # the file names here. mdtraj_protein caches what they read.
+        # kept so SASA/DSSP can reopen the files with mdtraj; caches the result
         self.top_path = top_path
         self.traj_path = traj_path
         self.mdtraj_protein = None
 
     def protein_mask(self):
-        """True for every atom that belongs to the protein, False for the rest.
-
-        np.isin checks each residue name against the SOLVENT list, and the ~
-        flips the answer, so we keep the atoms that are NOT water or ions.
-        """
+        """True for protein atoms, False for water and ions."""
         return ~np.isin(self.resnames, SOLVENT)
 
     def select(self, atom_names):
-        """Positions of the protein atoms whose name is in the given list.
-
-        For example select(["CA"]) gives the alpha carbons, one per residue.
-        """
+        """Indices of protein atoms named in atom_names, e.g. select(["CA"])."""
         return np.where(self.protein_mask() & np.isin(self.names, atom_names))[0]
 
 
 def guess_element(name):
-    """Guess the element from the atom name, e.g. "CA" -> C and "1HB" -> H.
-
-    Atom names sometimes start with a number, so we drop any digits first and
-    then take the first letter.
-    """
+    """Guess the element from an atom name, e.g. "CA" -> C, "1HB" -> H."""
     letters = name.lstrip("0123456789")
     if letters == "":
         return "X"
@@ -106,8 +79,7 @@ def check_files(top_path, traj_path):
     if top_ext not in TOPOLOGY_FORMATS:
         raise ValueError("The topology format " + top_ext + " is not supported.")
 
-    # a PDB file already contains coordinates, the other formats only describe
-    # the atoms and need a separate trajectory file
+    # only PDB contains coordinates by itself; other formats need a trajectory file
     if top_ext != ".pdb" and traj_path is None:
         raise ValueError("A " + top_ext + " file does not contain any coordinates. "
                          "Please also upload a trajectory file (DCD, XTC, TRR or NC).")

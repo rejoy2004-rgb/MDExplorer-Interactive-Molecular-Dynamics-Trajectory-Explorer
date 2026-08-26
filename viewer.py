@@ -1,14 +1,6 @@
-"""Showing one frame of the simulation in 3D.
+"""Draws one frame in 3D by writing it out as PDB text for py3Dmol.
 
-py3Dmol draws the molecule in the browser, but it only understands text file
-formats. So we write one frame of our NumPy coordinates back out as PDB text
-and hand that over. Because the text is built from our own arrays, the 3D view
-works for every input format.
-
-Water and ions are left out of the PDB text completely, not just drawn
-differently. py3Dmol's zoomTo() fits the camera to every atom it is given, so
-if the water was included the camera would zoom out to fit the whole solvent
-box and the protein itself would look tiny in the middle of it.
+Water and ions are excluded, or the camera would zoom out to fit them.
 """
 
 import numpy as np
@@ -25,8 +17,7 @@ def make_pdb_text(system, frame):
         name = str(system.names[i])
         resname = str(system.resnames[i])
 
-        # a PDB file has fixed column positions, so the padding below matters.
-        # the atom name goes in columns 14-16, with one space in front of it.
+        # PDB uses fixed columns; pad short names with a leading space
         if len(name) < 4:
             name = " " + name.ljust(3)
 
