@@ -1,11 +1,27 @@
-"""Draws one frame in 3D by writing it out as PDB text for py3Dmol.
+"""Draws one frame in 3D by writing it out as PDB text and rendering it with PyMOL.
 
 Water and ions are excluded, or the camera would zoom out to fit them.
 """
 
+import threading
+
 import numpy as np
-import py3Dmol
-from stmol import showmol
+import pymol2
+
+# The classic `pymol.finish_launching()` API expects to run on the process's
+# main thread (it sets up a windowing/GL context), but Streamlit runs the
+# app script on a worker thread, so it hangs forever there. pymol2's PyMOL()
+# is the embeddable session API built for exactly this: no GUI, no
+# main-thread requirement.
+_session = pymol2.PyMOL()
+_session.start()
+cmd = _session.cmd
+
+# The session is still one shared object. Streamlit reruns each interaction
+# (e.g. every slider tick) on its own thread, so without this lock two
+# overlapping renders can corrupt PyMOL's state and crash the whole server,
+# dropping every connected browser.
+_pymol_lock = threading.Lock()
 
 
 def make_pdb_text(system, frame):
@@ -30,13 +46,17 @@ def make_pdb_text(system, frame):
     return "\n".join(lines)
 
 
-def show_structure(system, frame, width=900, height=520):
-    """Draw the protein as a rainbow coloured cartoon."""
-    view = py3Dmol.view(width=width, height=height)
-    view.addModel(make_pdb_text(system, frame), "pdb")
+def render_structure(system, frame, width=900, height=520):
+    """Render the protein as a rainbow coloured cartoon and return PNG bytes."""
+    with _pymol_lock:
+        cmd.reinitialize()
+        cmd.read_pdbstr(make_pdb_text(system, frame), "frame")
 
-    # colour the chain from blue at the start to red at the end
-    view.setStyle({"cartoon": {"color": "spectrum"}})
+        cmd.hide("everything")
+        cmd.show("cartoon")
+        cmd.spectrum("count", "rainbow", "name CA")
+        cmd.bg_color("white")
+        cmd.orient()
 
-    view.zoomTo()
-    showmol(view, height=height, width=width)
+        cmd.ray(width, height)
+        return cmd.png(None, width=width, height=height, dpi=150)

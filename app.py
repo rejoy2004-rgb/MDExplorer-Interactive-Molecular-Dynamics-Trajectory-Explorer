@@ -12,7 +12,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from molecule import load_simulation, TOPOLOGY_FORMATS, TRAJECTORY_FORMATS
-from viewer import show_structure
+from viewer import render_structure
 import analysis
 
 st.set_page_config(page_title="MolNumPy", layout="wide")
@@ -216,7 +216,7 @@ def main():
     # --- the 3D view ---
     st.subheader("3D structure")
     st.caption("Frame %d, at %.1f ps" % (frame, system.time[frame]))
-    show_structure(system, frame)
+    st.image(render_structure(system, frame))
     st.slider("Frame", min_value=0, max_value=system.n_frames - 1, key="frame")
 
     # --- the graph ---
