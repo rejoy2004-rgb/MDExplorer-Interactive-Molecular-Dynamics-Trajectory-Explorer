@@ -59,6 +59,37 @@ than the rest. Everything else is calculated directly from the NumPy arrays.
 * if one measurement cannot be calculated, the page says which one and shows
   the reason, and the other measurements still appear
 
+## Screenshots
+
+The screenshots use Adenylate Kinase (214 residues, 3,341 atoms, 98 frames)
+from the MDAnalysis test files (`adk.psf` + `adk_dims.dcd`).
+
+**Overview: file upload, simulation information and the 3D structure at the
+chosen frame.** The slider moves through the frames.
+
+![Overview of the page: uploaded files, simulation information and the 3D structure](screenshots/01_overview.png)
+
+**RMSD graph and the numbers for the frame on screen.** The red dashed line marks
+the frame shown in 3D. Clicking a point on the graph jumps to that frame.
+
+![RMSD graph with the current frame marked, and the measurements for that frame](screenshots/02_analysis_rmsd.png)
+
+**RMSF per residue**, with the real residue numbers on the x axis.
+
+![RMSF bar chart for each residue](screenshots/03_rmsf.png)
+
+**Frame-range selection.** Dragging a box across the graph shades the range and
+shows the averages (and the lowest and highest RMSD) over those frames.
+
+![A selected range of frames and its average RMSD, Rg, SASA and hydrogen bonds](screenshots/04_range_selection.png)
+
+**Periodic-boundary warning.** This raw GROMACS output (`adk_oplsaa.gro` +
+`adk_oplsaa.xtc`) has the protein cut by the edge of the simulation box, which is
+visible in the 3D picture. MDExplorer warns that RMSD, RMSF and the other
+measurements may be misleading (see the next section).
+
+![Warning that the protein may cross a periodic boundary, with the split protein shown in 3D](screenshots/05_periodic_boundary_warning.png)
+
 ## Periodic-boundary warning
 
 A simulation box repeats itself in space, so MD programs wrap every atom back
