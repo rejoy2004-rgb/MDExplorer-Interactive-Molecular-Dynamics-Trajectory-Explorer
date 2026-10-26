@@ -11,7 +11,7 @@ TRAJECTORY_FORMATS = [".dcd", ".xtc", ".trr", ".nc"]
 
 # water and ion residue names, left out of every calculation
 SOLVENT = ["HOH", "WAT", "SOL", "TIP3", "SPC", "NA", "CL", "K", "MG",
-           "ZN", "SOD", "CLA", "POT", "ION"]
+           "ZN", "SOD", "CLA", "POT", "ION", "NA+", "CL-"]
 
 
 class MolecularSystem:
@@ -25,6 +25,13 @@ class MolecularSystem:
         self.names = np.array(universe.atoms.names)
         self.resids = np.array(universe.atoms.resids)
         self.resnames = np.array(universe.atoms.resnames)
+
+        # chain / segment label of each atom; a few formats have none, then every atom shares one label
+        if hasattr(universe.atoms, "segids"):
+            self.segids = np.array(universe.atoms.segids)
+        else:
+            self.segids = np.full(self.n_atoms, "")
+
         self.elements = np.array([guess_element(name) for name in self.names])
 
         # a few file formats simply do not have mass information at all
@@ -99,4 +106,9 @@ def load_simulation(top_path, traj_path=None):
     else:
         universe = mda.Universe(top_path, traj_path)
 
-    return MolecularSystem(universe, top_path, traj_path)
+    system = MolecularSystem(universe, top_path, traj_path)
+    if system.n_frames == 0:
+        raise ValueError("These files contain no frames, so there is nothing to show.")
+    if not system.protein_mask().any():
+        raise ValueError("No protein atoms were found, only water and ions.")
+    return system

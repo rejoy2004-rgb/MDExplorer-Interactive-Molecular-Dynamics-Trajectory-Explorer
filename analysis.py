@@ -7,6 +7,12 @@ ions are excluded everywhere.
 """
 
 import math
+import os
+
+# mdtraj's multi-threaded SASA sometimes returns a wrong area for a frame when
+# the CPU is busy; one thread was reliable. Must be set before mdtraj is imported.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import mdtraj as md
 import numpy as np
 
@@ -20,9 +26,71 @@ BOND_LENGTH = 1.3
 HBOND_DIST = 2.5    # Angstrom, hydrogen to acceptor
 HBOND_ANGLE = 120   # degrees, donor-H...acceptor
 
-# DSSP uses eight letters, we group them into the three shapes people talk about
-HELIX = ["H", "G", "I"]
-SHEET = ["E", "B"]
+# mdtraj's compute_dssp is used with its default simplified=True, so it already
+# gives only three letters: H (helix), E (sheet) and C (coil), plus "NA" for
+# residues it cannot assign. Anything that is not H or E counts as coil.
+HELIX = ["H"]
+SHEET = ["E"]
+
+
+# Angstrom; two neighbouring alpha carbons are about 3.8 A apart (at most about
+# 4.1 A in the real trajectory we tested). A protein cut by the edge of the
+# simulation box jumps by tens of A, so 6 A is far above any real bond and far
+# below a box-sized jump.
+CA_JUMP_LIMIT = 6.0
+
+# the three possible answers of check_periodic_split
+SPLIT = "Potential split detected"
+NO_SPLIT = "No obvious split detected"
+UNKNOWN = "Unable to assess reliably"
+
+
+def check_periodic_split(system, max_distance=CA_JUMP_LIMIT):
+    """Warn if the protein may be cut by the edge of the simulation box.
+
+    MD programs wrap atoms back into the box, so one molecule can end up as
+    pieces on opposite sides. We look for that by measuring the distance
+    between neighbouring alpha carbons (residue n and n+1 of the same chain);
+    those must always be about 3.8 A apart. Returns (answer, details), where
+    answer is SPLIT, NO_SPLIT or UNKNOWN.
+
+    This is only a hint, not a proof. It cannot see a split that happens
+    between chains, or inside a stretch with missing residues, and it never
+    uses the box size. NO_SPLIT does NOT prove the trajectory is whole."""
+    ca = system.select(["CA"])
+
+    # only compare residues that are neighbours in the sequence and in the same
+    # chain; a numbering gap or a chain change is a real break, not a split
+    first = []
+    second = []
+    for k in range(len(ca) - 1):
+        a = ca[k]
+        b = ca[k + 1]
+        if system.segids[a] == system.segids[b] and system.resids[b] - system.resids[a] == 1:
+            first.append(a)
+            second.append(b)
+
+    if len(first) == 0:
+        return UNKNOWN, ("There are no pairs of neighbouring alpha carbons to compare "
+                         "(no CA atoms, one residue per chain, or gaps in the numbering).")
+
+    # distance of every neighbouring pair in every frame, shape (frames, pairs)
+    jumps = np.linalg.norm(system.coordinates[:, second] - system.coordinates[:, first], axis=2)
+    if not np.isfinite(jumps).any():
+        return UNKNOWN, "The alpha carbon coordinates are not finite numbers."
+    jumps = np.where(np.isfinite(jumps), jumps, 0.0)   # a pair with no position cannot show a split
+    too_far = jumps > max_distance
+    frames_split = int(too_far.any(axis=1).sum())
+
+    if frames_split == 0:
+        return NO_SPLIT, ("The largest distance between neighbouring alpha carbons is %.1f A "
+                          "(%d pairs checked in every frame)." % (jumps.max(), len(first)))
+
+    worst = np.unravel_index(jumps.argmax(), jumps.shape)
+    return SPLIT, ("%d of %d frames have neighbouring alpha carbons more than %.1f A apart; "
+                   "the largest gap is %.1f A, between residues %d and %d in frame %d."
+                   % (frames_split, system.n_frames, max_distance, jumps.max(),
+                      system.resids[first[worst[1]]], system.resids[second[worst[1]]], worst[0]))
 
 
 def frame_positions(system, frame_index, atom_indices):
@@ -314,15 +382,23 @@ def mdtraj_protein(system):
 
 def calculate_sasa(system):
     """Total solvent accessible surface area per frame (mdtraj's Shrake-Rupley)."""
-    # per-atom area, converted to a plain list
-    per_atom = md.shrake_rupley(mdtraj_protein(system)).tolist()
+    traj = mdtraj_protein(system)
 
-    # sum per atom; convert mdtraj's nm2 to A2
-    return [sum(frame) * 100 for frame in per_atom]
+    # One frame per call: when given several frames, mdtraj does not clear its work
+    # buffer between them, so every frame after the first comes out about 0.1% too large.
+    areas = []
+    for i in range(traj.n_frames):
+        # per-atom area of this frame, converted to a plain list
+        per_atom = md.shrake_rupley(traj[i]).tolist()[0]
+
+        # sum per atom; convert mdtraj's nm2 to A2
+        areas.append(sum(per_atom) * 100)
+
+    return areas
 
 
 def calculate_secondary_structure(system):
-    """DSSP letter per residue per frame (mdtraj)."""
+    """DSSP letter (H, E, C or NA) per residue per frame (mdtraj, simplified 3-class scheme)."""
     return md.compute_dssp(mdtraj_protein(system)).tolist()
 
 

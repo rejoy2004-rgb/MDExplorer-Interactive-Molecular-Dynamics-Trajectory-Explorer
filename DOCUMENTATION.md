@@ -1,4 +1,4 @@
-# MolNumPy — Function & Library Documentation
+# MDExplorer — Function & Library Documentation
 
 This document explains what every function in the project does, the algorithm/idea
 behind it, and the official documentation it is based on. Use it as the reference
@@ -30,9 +30,13 @@ read pattern, see the coordinates docs above). If a format has no mass records
 (some PDBs), all atoms are given equal weight (mass = 1) rather than mass = 0,
 since a total mass of zero would break center-of-mass and Rg later.
 
+`MolecularSystem` also stores `segids`, the chain/segment label of each atom
+(one shared empty label if the format has none); `check_periodic_split` uses it
+so that residues of different chains are never compared.
+
 ### `MolecularSystem.protein_mask(self)`
 Boolean mask, `True` for non-solvent atoms. Solvent residue names (water/ion
-codes such as `HOH`, `SOL`, `NA`, `CL`) are excluded from every downstream
+codes such as `HOH`, `SOL`, `NA`, `CL`, and the GROMACS ion names `NA+`, `CL-`) are excluded from every downstream
 measurement — this is standard MD-analysis practice since including solvent
 would swamp RMSD/Rg/SASA with irrelevant bulk motion. Uses `numpy.isin`:
 https://numpy.org/doc/stable/reference/generated/numpy.isin.html
@@ -59,7 +63,8 @@ coordinates — any non-PDB topology also has a trajectory file attached.
 Entry point: validates the files, builds an MDAnalysis `Universe` (single-file or
 topology+trajectory form — both are documented constructor signatures:
 https://docs.mdanalysis.org/stable/documentation_pages/core/universe.html#core-object-universe),
-and wraps it in a `MolecularSystem`.
+and wraps it in a `MolecularSystem`. Raises a `ValueError` if the file contains
+no protein atoms (only water and ions) or no frames.
 
 ---
 
@@ -89,6 +94,31 @@ References used:
   (algorithm: A. Shrake, J.A. Rupley, *J. Mol. Biol.* 79 (1973))
 - mdtraj `compute_dssp` (DSSP secondary structure assignment): https://www.mdtraj.org/1.9.8.dev0/api/generated/mdtraj.compute_dssp.html
   (algorithm: W. Kabsch, C. Sander, *Biopolymers* 22 (1983))
+
+### `check_periodic_split(system, max_distance=CA_JUMP_LIMIT)`
+A warning, not a correction. MD programs wrap atoms back into the simulation
+box, so a protein can be cut into pieces on opposite sides of the box and the
+files still load. This function looks at every pair of neighbouring alpha
+carbons (residue n and n+1 of the same chain, found with `system.select(["CA"])`,
+`system.segids` and `system.resids`) in every frame and returns
+`(answer, details)`:
+- `SPLIT` ("Potential split detected"): some pair is further apart than
+  `CA_JUMP_LIMIT` (6 Å; a real pair is about 3.8 Å, and 4.1 Å at most in the
+  real test trajectory). `details` names the frame and the residues.
+- `NO_SPLIT` ("No obvious split detected"): no such pair was found.
+- `UNKNOWN` ("Unable to assess reliably"): there was nothing to compare, or the
+  coordinates are not finite.
+
+Pairs from different chains or with a gap in the residue numbers are never
+compared, so chain ends and missing residues are not mistaken for splits. The
+box dimensions are never used, so a missing box is not treated as proof that the
+protein is whole. The result is a hint only: `NO_SPLIT` does not prove the
+trajectory is whole (side chains, other atoms, splits between chains and
+sub-6 Å jumps are not examined), and chains that share one chain label while
+continuing the residue numbering can give a false alarm. Tested on real data:
+raw GROMACS GRO/TPR+XTC gives `SPLIT` (largest gap 79.5 Å), a whole PSF+DCD
+trajectory and the same GROMACS trajectory after MDAnalysis unwrapping give
+`NO_SPLIT`. Unit tests: `test_periodic_check.py` (`python test_periodic_check.py`).
 
 ### `frame_positions(system, frame_index, atom_indices)`
 Pulls out `[x, y, z]` for a set of atoms at one frame as plain Python lists
@@ -156,32 +186,42 @@ directly from mdtraj's implementations.
 Total solvent accessible surface area per frame, from mdtraj's
 `shrake_rupley` (per-atom areas, in nm²), summed per frame and converted to Å²
 (`× 100`, since 1 nm² = 100 Å²). Reference: mdtraj `shrake_rupley` docs above.
+`shrake_rupley` is called once per frame, not once for the whole trajectory:
+in mdtraj 1.11.0 the work buffer is not cleared between the frames of one call,
+so every frame after the first came out about 0.1% too large (the same frame
+repeated in one call gave 10181.4 Å² for the first copy and 10191.3 Å² for the
+later ones). `analysis.py` also sets `OMP_NUM_THREADS=1` before importing
+mdtraj, because the multi-threaded version sometimes returned a wrong area for
+a frame when the CPU was busy. The cost is speed: on one test machine, about
+0.6 s per frame for a 3,341-atom protein.
 
 ### `calculate_secondary_structure(system)`
-Per-residue, per-frame DSSP letter codes from mdtraj's `compute_dssp`. Reference
-above.
+Per-residue, per-frame DSSP letter codes from mdtraj's `compute_dssp`, called
+with its default `simplified=True`. That gives three letters: `H` (helix),
+`E` (sheet) and `C` (coil), plus `"NA"` for residues that cannot be assigned.
+Reference above.
 
 ### `summarize(codes)`
-Turns one frame's DSSP letters into helix / sheet / coil percentages, grouping
-DSSP's eight codes into the three commonly reported categories:
-`HELIX = ["H", "G", "I"]` (alpha helix, 3₁₀ helix, pi helix),
-`SHEET = ["E", "B"]` (extended strand, beta bridge), everything else is coil.
-This H/G/I vs E/B vs other grouping is the conventional simplification of the
-DSSP alphabet (see the DSSP algorithm reference above). `"NA"` entries (residues
-DSSP can't assign, usually chain termini) are excluded from the percentage base.
+Turns one frame's DSSP letters into helix / sheet / coil percentages.
+Because `compute_dssp` already returns the simplified 3-class letters,
+`HELIX = ["H"]`, `SHEET = ["E"]`, and everything else (`"C"`) is coil.
+`"NA"` entries (residues DSSP can't assign, usually chain termini) are excluded
+from the percentage base.
 
 ---
 
 ## 3. viewer.py — 3D visualization
 
-Renders one frame of the protein by writing it out as PDB-format text and handing
-that to **py3Dmol** (via the **stmol** Streamlit wrapper) for interactive 3D
-rendering in the browser.
+Renders one frame of the protein by writing it out as PDB-format text, loading
+it into an embedded **PyMOL** session (`pymol2`, from the
+`pymol-open-source-whl` package) and returning a rendered PNG image that the
+page shows with `st.image`.
 
 - PDB file format specification (ATOM record column layout used in
   `make_pdb_text`): https://www.wwpdb.org/documentation/file-format-content/format33/sect9.html#ATOM
-- py3Dmol: https://3dmol.csb.pitt.edu/ and https://pypi.org/project/py3Dmol/
-- stmol (`showmol`, the Streamlit↔py3Dmol bridge): https://github.com/napoles-uach/stmol
+- PyMOL (open source): https://github.com/schrodinger/pymol-open-source
+- `pymol2` (embeddable PyMOL sessions without a GUI):
+  https://pymolwiki.org/index.php/Launching_From_a_Script
 
 ### `make_pdb_text(system, frame)`
 Writes out only the protein atoms (`protein_mask()`, so water/ions don't appear
@@ -189,12 +229,12 @@ and don't throw off the viewer's auto-zoom) of one frame as fixed-column PDB
 `ATOM` records, following the PDB format's column spec linked above (atom
 serial, atom name, residue name, chain, residue number, x/y/z, element).
 
-### `show_structure(system, frame, width=900, height=520)`
-Builds a py3Dmol `view`, loads the generated PDB text as a model
-(`view.addModel(..., "pdb")` — py3Dmol model-loading API), applies a
-`"cartoon"` style colored by `"spectrum"` (rainbow N→C terminus, a built-in
-py3Dmol color scheme), zooms to fit (`view.zoomTo()`), and renders it into the
-Streamlit page with `stmol.showmol`.
+### `render_structure(system, frame, width=900, height=520)`
+Resets the PyMOL session, loads the generated PDB text (`cmd.read_pdbstr`),
+shows it as a cartoon coloured as a rainbow from the N to the C terminus
+(`cmd.spectrum`), orients the camera to fit (`cmd.orient`), ray-traces the image
+and returns PNG bytes. A lock (`_pymol_lock`) makes sure two Streamlit reruns do
+not use the single shared PyMOL session at the same time.
 
 ---
 
@@ -222,12 +262,20 @@ The web interface: file upload, running all analyses, and interactive charts.
 ### `save_upload(uploaded_file)`
 Writes a Streamlit `UploadedFile`'s bytes to a real temporary file on disk
 (`tempfile.mkstemp` + `os.fdopen`) and returns its path, since MDAnalysis/mdtraj
-readers expect a filesystem path, not an in-memory buffer.
+readers expect a filesystem path, not an in-memory buffer. `main()` deletes these
+temporary files after every load, successful or not (it first runs `gc.collect()`,
+because a reader that failed to open is only closed by the garbage collector and
+Windows will not delete an open file).
 
 ### `run_all_analysis(system)`
 Runs every function in `analysis.py` against the loaded system, catching
 exceptions per-measurement so one failing calculation (e.g. no hydrogens present
-for hydrogen bonds) doesn't prevent the others from showing.
+for hydrogen bonds) doesn't prevent the others from showing. It returns two
+dictionaries: `results` (the values, or `None` for a failed measurement) and
+`errors` (the exception type and message for each failure). `main()` lists the
+errors in a warning box above the 3D view, so "Not available" always comes with
+a reason. Above that box it also shows the result of `check_periodic_split`
+(computed once at load) as a warning, a notice or a small caption.
 
 ### `show_number(value, unit="")`
 Formats a number to 2 decimal places with a unit, or `"Not available"` if the
@@ -247,7 +295,9 @@ Format the center-of-mass 3-vector and the helix/sheet/coil breakdown
 
 ### `make_plot(system, results, frame, metric)`
 Builds the Plotly figure for whichever metric is selected: a bar chart for RMSF
-(per-residue, not per-frame), a 3-row `make_subplots` figure for "All", or a
+(per-residue, not per-frame, with the bars placed at the residue numbers of the
+alpha carbons; it raises an error if there are not exactly as many residue
+numbers as RMSF values), a 3-row `make_subplots` figure for "All", or a
 line+marker scatter plot for RMSD/Rg with a red vertical line marking the
 current frame (`add_vline`) and a shaded rectangle for any selected frame range
 (`add_vrect`).
@@ -265,8 +315,12 @@ this is the documented pattern for widget state changes from non-widget events
 Page layout and control flow: sidebar file uploaders → load & run analysis on
 button click → simulation summary metrics → 3D structure view + frame slider →
 trajectory graph with click/range selection → per-frame numbers → per-range
-averaged numbers. Called directly at module level (`main()`), which is how a
-Streamlit script executes top-to-bottom on every rerun
+averaged numbers. Errors while reading the files are shown with `st.error`.
+A file with only one frame (for example a plain PDB) gets no frame slider, because
+Streamlit does not allow a slider whose minimum equals its maximum; a caption says
+that only frame 0 exists. Tests: `test_frames.py`.
+Called directly at module level (`main()`), which is how a Streamlit script
+executes top-to-bottom on every rerun
 (https://docs.streamlit.io/develop/concepts/architecture/run-your-app).
 
 ---
@@ -280,4 +334,4 @@ Streamlit script executes top-to-bottom on every rerun
 | NumPy | Arrays, `linalg.svd` for the Kabsch rotation, `isin`/`where`/`isfinite` | https://numpy.org/doc/stable/ |
 | Streamlit | Web UI framework | https://docs.streamlit.io/ |
 | Plotly | Interactive charts (RMSD/RMSF/Rg) | https://plotly.com/python/ |
-| py3Dmol / stmol | Interactive 3D molecular rendering in the browser | https://3dmol.csb.pitt.edu/ , https://github.com/napoles-uach/stmol |
+| PyMOL (`pymol2`) | 3D cartoon rendering of the protein | https://github.com/schrodinger/pymol-open-source |

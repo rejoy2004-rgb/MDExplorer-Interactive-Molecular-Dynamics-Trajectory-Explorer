@@ -1,8 +1,9 @@
-"""MolNumPy - a small tool for looking at molecular dynamics simulations.
+"""MDExplorer - a small tool for looking at molecular dynamics simulations.
 
 Start it from the terminal with:   streamlit run app.py
 """
 
+import gc
 import os
 import tempfile
 
@@ -15,7 +16,7 @@ from molecule import load_simulation, TOPOLOGY_FORMATS, TRAJECTORY_FORMATS
 from viewer import render_structure
 import analysis
 
-st.set_page_config(page_title="MolNumPy", layout="wide")
+st.set_page_config(page_title="MDExplorer", layout="wide")
 
 
 def save_upload(uploaded_file):
@@ -28,7 +29,8 @@ def save_upload(uploaded_file):
 
 
 def run_all_analysis(system):
-    """Run every measurement; store None (shown as "Not available") if one fails."""
+    """Run every measurement. If one fails, its result is None (shown as "Not
+    available") and the reason is kept in errors so the page can explain it."""
     to_run = {
         "rmsd": analysis.calculate_rmsd,
         "rmsf": analysis.calculate_rmsf,
@@ -40,13 +42,15 @@ def run_all_analysis(system):
     }
 
     results = {}
+    errors = {}
     for name in to_run:
         try:
             results[name] = to_run[name](system)
-        except Exception:
+        except Exception as error:
             results[name] = None
+            errors[name] = type(error).__name__ + ": " + str(error)
 
-    return results
+    return results, errors
 
 
 def show_number(value, unit=""):
@@ -88,10 +92,17 @@ def make_plot(system, results, frame, metric):
     """Build the Plotly graph for whichever metric the user picked."""
     frames = np.arange(system.n_frames)
 
+    # RMSF has one value per alpha carbon, so label its bars with that residue's number
+    if results["rmsf"] is not None:
+        residues = system.resids[system.select(["CA"])]
+        if len(residues) != len(results["rmsf"]):
+            raise ValueError("Got %d residue numbers but %d RMSF values."
+                             % (len(residues), len(results["rmsf"])))
+
     # RMSF is different from the others, it is per residue and not per frame
     if metric == "RMSF":
-        figure = go.Figure(go.Bar(x=np.arange(len(results["rmsf"])), y=results["rmsf"]))
-        figure.update_layout(xaxis_title="Residue", yaxis_title="RMSF (A)", height=350)
+        figure = go.Figure(go.Bar(x=residues, y=results["rmsf"]))
+        figure.update_layout(xaxis_title="Residue number", yaxis_title="RMSF (A)", height=350)
         return figure
 
     # all three metrics under each other, for comparing them
@@ -100,7 +111,7 @@ def make_plot(system, results, frame, metric):
         if results["rmsd"] is not None:
             figure.add_trace(go.Scatter(x=frames, y=results["rmsd"], name="RMSD"), row=1, col=1)
         if results["rmsf"] is not None:
-            figure.add_trace(go.Bar(x=np.arange(len(results["rmsf"])), y=results["rmsf"], name="RMSF"), row=2, col=1)
+            figure.add_trace(go.Bar(x=residues, y=results["rmsf"], name="RMSF"), row=2, col=1)
         if results["rg"] is not None:
             figure.add_trace(go.Scatter(x=frames, y=results["rg"], name="Rg"), row=3, col=1)
         figure.update_layout(height=700)
@@ -154,8 +165,7 @@ def handle_click(event, n_frames):
 
 
 def main():
-    st.title("MolNumPy")
-    st.caption("Molecular dynamics trajectory explorer")
+    st.title("MDExplorer — Interactive Molecular Dynamics Trajectory Explorer")
 
     # --- the sidebar, where the files are uploaded ---
     with st.sidebar:
@@ -181,15 +191,32 @@ def main():
         try:
             with st.spinner("Reading the files and running the analysis..."):
                 system = load_simulation(top_path, traj_path)
-                results = run_all_analysis(system)
+                results, errors = run_all_analysis(system)
 
             # session_state survives reruns, so we don't reload on every click
             st.session_state["system"] = system
             st.session_state["results"] = results
+            st.session_state["errors"] = errors
+            st.session_state["periodic"] = analysis.check_periodic_split(system)
             st.session_state["frame"] = 0
             st.session_state["selected_range"] = None
         except ValueError as error:
+            # our own checks in molecule.py, already worded for the user
             st.error(str(error))
+        except Exception as error:
+            # anything else, e.g. a corrupt file that MDAnalysis cannot parse
+            st.error("Could not read these files. " + type(error).__name__ + ": " + str(error))
+        finally:
+            # the temp copies are not needed any more: a good load holds everything in
+            # memory and a bad one is over. A failed MDAnalysis reader is only closed when
+            # Python's garbage collector runs, and Windows will not delete an open file.
+            gc.collect()
+            for path in (top_path, traj_path):
+                if path is not None:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass  # still locked (for example by a virus scanner); leave it
 
     # nothing loaded yet, so there is nothing else to draw
     if "system" not in st.session_state:
@@ -198,12 +225,14 @@ def main():
 
     system = st.session_state["system"]
     results = st.session_state["results"]
+    errors = st.session_state.get("errors", {})
 
     # apply a frame picked last run, before the slider is drawn
     if "new_frame" in st.session_state:
         st.session_state["frame"] = st.session_state.pop("new_frame")
 
-    frame = st.session_state["frame"]
+    # with one frame there is no slider, so Streamlit may have dropped the "frame" key
+    frame = st.session_state.get("frame", 0)
 
     # --- what was loaded ---
     st.subheader("Simulation information")
@@ -213,11 +242,38 @@ def main():
     col3.metric("Frames", "{:,}".format(system.n_frames))
     col4.metric("Length", "%.1f ps" % system.time[-1])
 
+    # warn before the numbers are read if the protein may be cut by the box edge
+    if "periodic" in st.session_state:
+        answer, details = st.session_state["periodic"]
+        if answer == analysis.SPLIT:
+            st.warning("**The protein may cross a periodic boundary.** " + details + "\n\n"
+                       "RMSD, RMSF, radius of gyration, centre of mass and the 3D structure may be "
+                       "misleading. MDExplorer has not changed your coordinates. Make the "
+                       "trajectory whole with an external tool (the README shows a GROMACS "
+                       "example), check it, and load the corrected files.")
+        elif answer == analysis.UNKNOWN:
+            st.info("MDExplorer could not reliably check whether the protein crosses a "
+                    "periodic boundary. " + details)
+        else:
+            st.caption("Periodic-boundary check: " + answer.lower() + ". " + details +
+                       " This is a limited check and does not prove the trajectory is whole.")
+
+    # say why any measurement is "Not available"
+    if len(errors) > 0:
+        lines = ["Some measurements could not be calculated:"]
+        for name in errors:
+            lines.append("- **" + name + "**: " + errors[name])
+        st.warning("\n".join(lines))
+
     # --- the 3D view ---
     st.subheader("3D structure")
     st.caption("Frame %d, at %.1f ps" % (frame, system.time[frame]))
     st.image(render_structure(system, frame))
-    st.slider("Frame", min_value=0, max_value=system.n_frames - 1, key="frame")
+    if system.n_frames > 1:
+        st.slider("Frame", min_value=0, max_value=system.n_frames - 1, key="frame")
+    else:
+        # Streamlit does not allow a slider whose minimum equals its maximum
+        st.caption("This file has only one frame, so only frame 0 is available.")
 
     # --- the graph ---
     st.subheader("Trajectory analysis")
