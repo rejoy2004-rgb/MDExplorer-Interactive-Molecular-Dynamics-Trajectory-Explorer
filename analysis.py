@@ -6,6 +6,8 @@ which still come from mdtraj (large, established algorithms). Water and
 ions are excluded everywhere.
 """
 
+import csv
+import io
 import math
 import os
 
@@ -180,14 +182,17 @@ def superimpose(mobile, reference):
     return rotated
 
 
-def calculate_rmsd(system):
-    """RMSD (Root Mean Square Deviation) of the backbone per frame, vs frame 0."""
+def calculate_rmsd(system, reference_frame=0):
+    """RMSD (Root Mean Square Deviation) of the backbone per frame, vs one reference frame
+    (the first frame unless told otherwise)."""
     atoms = system.select(BACKBONE).tolist()
     if len(atoms) == 0:
         raise ValueError("No protein backbone atoms were found in this file.")
+    if not 0 <= reference_frame < system.n_frames:
+        raise ValueError("The reference frame must be between 0 and %d." % (system.n_frames - 1))
 
-    # the first frame is the reference that everything is compared against
-    reference = mean_center(frame_positions(system, 0, atoms))
+    # the reference frame is what everything is compared against
+    reference = mean_center(frame_positions(system, reference_frame, atoms))
 
     rmsd = []
     for i in range(system.n_frames):
@@ -368,16 +373,73 @@ def calculate_hbonds(system):
     return counts
 
 
-def mdtraj_protein(system):
-    """Reopen the file with mdtraj (cached), keeping only the protein."""
-    if system.mdtraj_protein is None:
-        if system.traj_path is None:
-            traj = md.load(system.top_path)
-        else:
-            traj = md.load(system.traj_path, top=system.top_path)
-        system.mdtraj_protein = traj.atom_slice(traj.top.select("protein"))
+# C-terminal oxygens are named differently by each force field (OT1/OT2, OC1/OC2, O1/O2);
+# mdtraj's own file readers rename them to O/OXT, and DSSP needs an atom called O
+TERMINAL_OXYGEN = {"OT1": "O", "OC1": "O", "O1": "O", "OT2": "OXT", "OC2": "OXT", "O2": "OXT"}
 
+
+def mdtraj_protein(system):
+    """The protein as an mdtraj trajectory (cached), built from the system's own arrays.
+
+    SASA and DSSP come from mdtraj, which only needs atom names, residues, elements and
+    coordinates. Building it from our arrays (not from the files) means they work for every
+    file format, including .tpr, which mdtraj cannot read."""
+    if system.mdtraj_protein is not None:
+        return system.mdtraj_protein
+
+    atoms = np.where(system.protein_mask())[0]
+    topology = md.Topology()
+    chain = None
+    previous_segid = None
+    previous_resid = None
+
+    start = 0
+    while start < len(atoms):
+        first = atoms[start]
+
+        # one residue = the run of atoms with the same chain label, residue number and name
+        stop = start
+        while (stop < len(atoms) and system.segids[atoms[stop]] == system.segids[first]
+               and system.resids[atoms[stop]] == system.resids[first]
+               and system.resnames[atoms[stop]] == system.resnames[first]):
+            stop += 1
+        group = atoms[start:stop]
+
+        # a new chain starts when the chain label changes or the residue number does not go up
+        if chain is None or system.segids[first] != previous_segid or system.resids[first] <= previous_resid:
+            chain = topology.add_chain()
+        residue = topology.add_residue(str(system.resnames[first]), chain, resSeq=int(system.resids[first]))
+
+        names = [str(system.names[a]) for a in group]
+        for a, name in zip(group, names):
+            if "O" not in names:
+                name = TERMINAL_OXYGEN.get(name, name)
+            try:
+                element = md.element.get_by_symbol(system.elements[a])
+            except KeyError:
+                raise ValueError("Cannot tell which element atom %s of residue %d is." % (name, system.resids[a]))
+            topology.add_atom(name, element, residue)
+
+        previous_segid = system.segids[first]
+        previous_resid = system.resids[first]
+        start = stop
+
+    # mdtraj works in nm, we store Angstrom
+    system.mdtraj_protein = md.Trajectory(system.coordinates[:, atoms, :] / 10.0, topology)
     return system.mdtraj_protein
+
+
+def check_no_overlap(frame):
+    """mdtraj's SASA code stops the whole program (not just the calculation) if two atoms sit at
+    exactly the same position, so look for that first and raise an ordinary error instead."""
+    positions = np.round(frame.xyz[0], 5)
+    _, inverse, counts = np.unique(positions, axis=0, return_inverse=True, return_counts=True)
+    if (counts > 1).any():
+        group = np.where(inverse.ravel() == np.where(counts > 1)[0][0])[0]
+        atoms = " and ".join(str(frame.top.atom(i)) for i in group)
+        raise ValueError("Atoms %s are at exactly the same position, which mdtraj's SASA code "
+                         "cannot handle (it would stop the whole program). Fix or remove "
+                         "the overlapping atoms and reload." % atoms)
 
 
 def calculate_sasa(system):
@@ -388,6 +450,8 @@ def calculate_sasa(system):
     # buffer between them, so every frame after the first comes out about 0.1% too large.
     areas = []
     for i in range(traj.n_frames):
+        check_no_overlap(traj[i])
+
         # per-atom area of this frame, converted to a plain list
         per_atom = md.shrake_rupley(traj[i]).tolist()[0]
 
@@ -423,3 +487,46 @@ def summarize(codes):
 
     total = len(assigned)
     return helix / total * 100, sheet / total * 100, coil / total * 100
+
+
+def per_frame_csv(system, results):
+    """The per-frame results as CSV text. A measurement that is not available is left empty."""
+    def value(name, i):
+        if results[name] is None:
+            return ""
+        return round(results[name][i], 6)
+
+    columns = ["frame", "time_ps", "rmsd_A", "rg_A", "sasa_A2", "hydrogen_bonds",
+               "com_x_A", "com_y_A", "com_z_A", "helix_percent", "sheet_percent", "coil_percent"]
+    text = io.StringIO()
+    writer = csv.writer(text, lineterminator="\n")
+    writer.writerow(columns)
+
+    for i in range(system.n_frames):
+        if results["com"] is None:
+            com = ["", "", ""]
+        else:
+            com = [round(x, 6) for x in results["com"][i]]
+        if results["secondary"] is None:
+            shapes = ["", "", ""]
+        else:
+            shapes = [round(x, 6) for x in summarize(results["secondary"][i])]
+
+        # "frame" is the frame's number in the original file (they differ when frames were skipped)
+        writer.writerow([system.frame_numbers[i], round(float(system.time[i]), 6), value("rmsd", i), value("rg", i),
+                         value("sasa", i), value("hbonds", i), *com, *shapes])
+
+    return text.getvalue()
+
+
+def rmsf_csv(system, results):
+    """The RMSF of every residue as CSV text (empty if RMSF is not available)."""
+    text = io.StringIO()
+    writer = csv.writer(text, lineterminator="\n")
+    writer.writerow(["position", "residue_number", "residue_name", "rmsf_A"])
+
+    if results["rmsf"] is not None:
+        for position, atom in enumerate(system.select(["CA"])):
+            writer.writerow([position + 1, system.resids[atom], system.resnames[atom], round(results["rmsf"][position], 6)])
+
+    return text.getvalue()

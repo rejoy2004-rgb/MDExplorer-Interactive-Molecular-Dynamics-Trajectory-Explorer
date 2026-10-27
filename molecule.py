@@ -17,9 +17,13 @@ SOLVENT = ["HOH", "WAT", "SOL", "TIP3", "SPC", "NA", "CL", "K", "MG",
 class MolecularSystem:
     """One simulation, stored as plain NumPy arrays: atom info + per-frame coordinates."""
 
-    def __init__(self, universe, top_path, traj_path):
+    def __init__(self, universe, stride=1):
         self.n_atoms = len(universe.atoms)
-        self.n_frames = len(universe.trajectory)
+
+        # a long trajectory can be read every stride-th frame, e.g. stride 10 keeps frames 0, 10, 20, ...
+        self.stride = stride
+        self.frame_numbers = np.arange(0, len(universe.trajectory), stride)
+        self.n_frames = len(self.frame_numbers)
 
         # information about the atoms, which is the same in every frame
         self.names = np.array(universe.atoms.names)
@@ -48,16 +52,18 @@ class MolecularSystem:
         self.coordinates = np.zeros((self.n_frames, self.n_atoms, 3), dtype=np.float32)
         self.time = np.zeros(self.n_frames)
 
-        for i, frame in enumerate(universe.trajectory):
+        for i, frame in enumerate(universe.trajectory[::stride]):
             self.coordinates[i] = universe.atoms.positions
             self.time[i] = frame.time
 
-        # protein residues only, otherwise water would inflate this count
-        self.n_residues = len(np.unique(self.resids[self.protein_mask()]))
+        # protein residues only, otherwise water would inflate this count. A new residue starts wherever
+        # the chain label, residue number or name changes, so chains that reuse numbers count separately.
+        protein = self.protein_mask()
+        chain, number, name = self.segids[protein], self.resids[protein], self.resnames[protein]
+        starts = (chain[1:] != chain[:-1]) | (number[1:] != number[:-1]) | (name[1:] != name[:-1])
+        self.n_residues = 0 if len(number) == 0 else 1 + int(starts.sum())
 
-        # kept so SASA/DSSP can reopen the files with mdtraj; caches the result
-        self.top_path = top_path
-        self.traj_path = traj_path
+        # SASA and DSSP are done by mdtraj; analysis.mdtraj_protein() fills this in once and reuses it
         self.mdtraj_protein = None
 
     def protein_mask(self):
@@ -77,8 +83,11 @@ def guess_element(name):
     return letters[0]
 
 
-def check_files(top_path, traj_path):
+def check_files(top_path, traj_path, stride=1):
     """Check the files before opening them, so we can show a clear error."""
+    if stride < 1:
+        raise ValueError("Use every Nth frame: N must be 1 or more.")
+
     if top_path is None:
         raise ValueError("Please upload a topology file (PDB, PSF, GRO, TPR or PRMTOP).")
 
@@ -97,16 +106,16 @@ def check_files(top_path, traj_path):
             raise ValueError("The trajectory format " + traj_ext + " is not supported.")
 
 
-def load_simulation(top_path, traj_path=None):
-    """Read the files and return one MolecularSystem."""
-    check_files(top_path, traj_path)
+def load_simulation(top_path, traj_path=None, stride=1):
+    """Read the files and return one MolecularSystem (every stride-th frame)."""
+    check_files(top_path, traj_path, stride)
 
     if traj_path is None:
         universe = mda.Universe(top_path)
     else:
         universe = mda.Universe(top_path, traj_path)
 
-    system = MolecularSystem(universe, top_path, traj_path)
+    system = MolecularSystem(universe, stride)
     if system.n_frames == 0:
         raise ValueError("These files contain no frames, so there is nothing to show.")
     if not system.protein_mask().any():

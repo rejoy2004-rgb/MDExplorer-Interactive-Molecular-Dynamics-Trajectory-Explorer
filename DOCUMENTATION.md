@@ -21,18 +21,25 @@ plain object (`MolecularSystem`) that the rest of the app works with as NumPy ar
   https://docs.mdanalysis.org/stable/documentation_pages/coordinates/init.html
 - Supported file formats reference: https://docs.mdanalysis.org/stable/documentation_pages/coordinates/init.html#supported-coordinate-formats
 
-### `MolecularSystem.__init__(self, universe, top_path, traj_path)`
+### `MolecularSystem.__init__(self, universe, stride=1)`
 Converts an MDAnalysis `Universe` into plain NumPy arrays: atom names, residue ids,
 residue names, elements, masses, and a `(frames, atoms, 3)` coordinate array
-(`float32` to halve memory vs `float64`). Iterates `universe.trajectory` once to
+(`float32` to halve memory vs `float64`). Iterates `universe.trajectory[::stride]` once to
 copy `positions` and `time` per frame (this is the standard MDAnalysis trajectory
-read pattern, see the coordinates docs above). If a format has no mass records
+read pattern, see the coordinates docs above). With `stride=10` only frames 0, 10, 20, ...
+are kept; `frame_numbers` remembers their numbers in the original file and `time` their
+original times. A long trajectory (10,001 frames of a 7,148-atom protein would need about
+0.9 GB and hours of SASA) is meant to be read with a stride. If a format has no mass records
 (some PDBs), all atoms are given equal weight (mass = 1) rather than mass = 0,
 since a total mass of zero would break center-of-mass and Rg later.
 
 `MolecularSystem` also stores `segids`, the chain/segment label of each atom
 (one shared empty label if the format has none); `check_periodic_split` uses it
-so that residues of different chains are never compared.
+so that residues of different chains are never compared. `n_residues` counts a new
+residue wherever the chain label, residue number or residue name changes, so chains that
+reuse residue numbers are counted separately (insulin, 4 chains of 21 and 30 residues
+numbered from 1, has 102 residues, not 30). The mdtraj copy of the protein used for SASA
+and DSSP is cached in `mdtraj_protein`; the system keeps no file paths.
 
 ### `MolecularSystem.protein_mask(self)`
 Boolean mask, `True` for non-solvent atoms. Solvent residue names (water/ion
@@ -53,13 +60,13 @@ Element guess from an atom name (PDB atom names sometimes prefix a digit, e.g.
 letter. This is the common heuristic used because PDB/PSF files don't always
 carry an explicit element column (PDB format spec: https://www.wwpdb.org/documentation/file-format).
 
-### `check_files(top_path, traj_path)`
+### `check_files(top_path, traj_path, stride=1)`
 Validates the uploaded files before attempting to parse them, so the user gets a
-readable error instead of a low-level parser traceback. Checks: a topology file
-was given, its extension is supported, and — since only PDB self-contains
-coordinates — any non-PDB topology also has a trajectory file attached.
+readable error instead of a low-level parser traceback. Checks: the stride is at
+least 1, a topology file was given, its extension is supported, and — since only PDB
+self-contains coordinates — any non-PDB topology also has a trajectory file attached.
 
-### `load_simulation(top_path, traj_path=None)`
+### `load_simulation(top_path, traj_path=None, stride=1)`
 Entry point: validates the files, builds an MDAnalysis `Universe` (single-file or
 topology+trajectory form — both are documented constructor signatures:
 https://docs.mdanalysis.org/stable/documentation_pages/core/universe.html#core-object-universe),
@@ -118,7 +125,7 @@ sub-6 Å jumps are not examined), and chains that share one chain label while
 continuing the residue numbering can give a false alarm. Tested on real data:
 raw GROMACS GRO/TPR+XTC gives `SPLIT` (largest gap 79.5 Å), a whole PSF+DCD
 trajectory and the same GROMACS trajectory after MDAnalysis unwrapping give
-`NO_SPLIT`. Unit tests: `test_periodic_check.py` (`python test_periodic_check.py`).
+`NO_SPLIT`.
 
 ### `frame_positions(system, frame_index, atom_indices)`
 Pulls out `[x, y, z]` for a set of atoms at one frame as plain Python lists
@@ -145,10 +152,14 @@ singular vector, and applies the resulting optimal rotation to `mobile`. This is
 the textbook Kabsch procedure — see the Wikipedia reference above, which lays
 out exactly this covariance → SVD → determinant-correction → rotation sequence.
 
-### `calculate_rmsd(system)`
+### `calculate_rmsd(system, reference_frame=0)`
 Root Mean Square Deviation of the protein backbone (N, CA, C, O) at every frame
-against frame 0, after superimposing each frame onto the reference with
-`superimpose()`. Standard RMSD definition (MDAnalysis rms docs, above).
+against one reference frame (frame 0 unless `reference_frame` says otherwise; the RMSD of
+the reference frame itself is 0), after superimposing each frame onto the reference with
+`superimpose()`. Standard RMSD definition (MDAnalysis rms docs, above). GROMACS's
+`gmx rms` compares with the starting structure of the run and uses the group "Backbone"
+(N, CA, C, without O) with mass weighting by default, so its curve differs slightly
+(see the Validation section of the README). `calculate_rmsf` always aligns to frame 0.
 
 ### `calculate_rmsf(system)`
 Root Mean Square Fluctuation of each residue's alpha carbon: aligns every frame
@@ -175,12 +186,18 @@ distance cutoff (`BOND_LENGTH` = 1.3 Å, a typical N–H/O–H bond length), com
 once from frame 0 since covalent bonding doesn't change during a simulation.
 
 ### `mdtraj_protein(system)`
-Lazily reopens the same files with **mdtraj** (cached on the `system` object so
-it only happens once), restricted to protein atoms via mdtraj's atom selection
-language (`traj.top.select("protein")`):
-https://www.mdtraj.org/1.9.8.dev0/atom_selection.html
-This is needed because SASA and DSSP are not hand-rolled here — they're taken
-directly from mdtraj's implementations.
+Builds the protein as an **mdtraj** trajectory (cached on the `system` object) from
+MDExplorer's own arrays: an `md.Topology` with one chain per run of residues (a new chain
+starts when the chain label changes or the residue number does not go up), one residue per
+run of atoms, atom names and elements, and the coordinates divided by 10 (Å to nm). SASA
+and DSSP are not hand-rolled here — they're taken directly from mdtraj's implementations —
+and because they now read our arrays, not the files, they work for every file format,
+including `.tpr`, which mdtraj cannot read. C-terminal oxygens named `OT1/OT2`, `OC1/OC2`
+or `O1/O2` (when the residue has no `O`) are renamed `O` and `OXT`, exactly as mdtraj's own
+file readers do, because DSSP needs an atom called `O`. Checked against the old file-based
+path: DSSP letters were identical on three datasets (0 of 2,634 residues differ) and SASA
+differed by at most 0.13 Å² out of about 10,000 (rounding). An atom whose element cannot be
+guessed from its name gives a clear error.
 
 ### `calculate_sasa(system)`
 Total solvent accessible surface area per frame, from mdtraj's
@@ -193,7 +210,11 @@ repeated in one call gave 10181.4 Å² for the first copy and 10191.3 Å² for t
 later ones). `analysis.py` also sets `OMP_NUM_THREADS=1` before importing
 mdtraj, because the multi-threaded version sometimes returned a wrong area for
 a frame when the CPU was busy. The cost is speed: on one test machine, about
-0.6 s per frame for a 3,341-atom protein.
+0.6 s per frame for a 3,341-atom protein and about 3 s per frame for a 7,148-atom one.
+`check_no_overlap` first looks for two atoms at exactly the same position (as in
+Val 12 of the crystal structure 4INS, where `CG1` and `CG2` coincide): mdtraj's C code
+answers that by stopping the whole Python process, which would take the web server down,
+so it is turned into an ordinary error message and SASA is skipped.
 
 ### `calculate_secondary_structure(system)`
 Per-residue, per-frame DSSP letter codes from mdtraj's `compute_dssp`, called
@@ -207,6 +228,16 @@ Because `compute_dssp` already returns the simplified 3-class letters,
 `HELIX = ["H"]`, `SHEET = ["E"]`, and everything else (`"C"`) is coil.
 `"NA"` entries (residues DSSP can't assign, usually chain termini) are excluded
 from the percentage base.
+
+### `per_frame_csv(system, results)` / `rmsf_csv(system, results)`
+Write the results as CSV text (Python's `csv` module, numbers rounded to 6 decimals).
+`per_frame_csv` has one row per loaded frame: `frame` (the frame's number in the original
+file, which differs from its position when a stride was used), `time_ps`, `rmsd_A`, `rg_A`,
+`sasa_A2`, `hydrogen_bonds`, `com_x_A`, `com_y_A`, `com_z_A` and the helix, sheet and coil
+percentages. A measurement that failed is left empty. `rmsf_csv` has one row per residue:
+`position`, `residue_number`, `residue_name`, `rmsf_A`. The units are the ones MDExplorer
+calculates in (Å, ps); multiply distances by 0.1 and divide times by 1000 for GROMACS's
+nm and ns. The RMSD column uses whichever reference frame was selected on the page.
 
 ---
 
@@ -261,8 +292,9 @@ The web interface: file upload, running all analyses, and interactive charts.
 
 ### `save_upload(uploaded_file)`
 Writes a Streamlit `UploadedFile`'s bytes to a real temporary file on disk
-(`tempfile.mkstemp` + `os.fdopen`) and returns its path, since MDAnalysis/mdtraj
-readers expect a filesystem path, not an in-memory buffer. `main()` deletes these
+(`tempfile.mkstemp` + `os.fdopen`) and returns its path, since MDAnalysis
+readers expect a filesystem path, not an in-memory buffer. Streamlit refuses uploads over
+200 MB by default; `.streamlit/config.toml` raises that to 2,000 MB because trajectories are big. `main()` deletes these
 temporary files after every load, successful or not (it first runs `gc.collect()`,
 because a reader that failed to open is only closed by the garbage collector and
 Windows will not delete an open file).
@@ -293,32 +325,41 @@ the chart).
 Format the center-of-mass 3-vector and the helix/sheet/coil breakdown
 (via `analysis.summarize`) for display.
 
-### `make_plot(system, results, frame, metric)`
+### `make_plot(system, results, frame, metric, x_values, gromacs_units, rmsd_reference)`
 Builds the Plotly figure for whichever metric is selected: a bar chart for RMSF
 (per-residue, not per-frame, with the bars placed at the residue numbers of the
 alpha carbons; it raises an error if there are not exactly as many residue
 numbers as RMSF values), a 3-row `make_subplots` figure for "All", or a
 line+marker scatter plot for RMSD/Rg with a red vertical line marking the
 current frame (`add_vline`) and a shaded rectangle for any selected frame range
-(`add_vrect`).
+(`add_vrect`). `x_values` is what the frame axis shows: the frame numbers, or each
+frame's time in ns. With `gromacs_units` the distances are multiplied by 0.1 (nm, as in
+GROMACS plots); only the graphs change, the numbers below them stay in Å and ps. The RMSD
+axis title names its reference frame ("RMSD vs frame 30 (nm)"). If residue numbers repeat
+(several chains numbered from 1), bars at the residue numbers would stack on top of each
+other, so the bars are drawn in file order, the axis says so, and hovering shows the real
+residue number.
 
-### `handle_click(event, n_frames)`
+### `handle_click(event, x_values)`
 Reads a Plotly click/box-select event from `st.plotly_chart`'s
-`on_select` callback data. A single clicked point jumps the frame slider to that
-frame; a multi-point (box) selection sets a frame range. Values are stashed in
+`on_select` callback data. A clicked point's x is a frame number or, with GROMACS-style
+axes, a time; the frame is the one whose `x_values` entry is nearest. A single clicked
+point jumps the frame slider to that frame; a multi-point (box) selection sets a frame range. Values are stashed in
 `st.session_state` and `st.rerun()` is called because Streamlit widgets can't be
 mutated directly after they've already been instantiated in the current run —
 this is the documented pattern for widget state changes from non-widget events
 (session_state docs above).
 
 ### `main()`
-Page layout and control flow: sidebar file uploaders → load & run analysis on
-button click → simulation summary metrics → 3D structure view + frame slider →
-trajectory graph with click/range selection → per-frame numbers → per-range
-averaged numbers. Errors while reading the files are shown with `st.error`.
+Page layout and control flow: sidebar file uploaders and the "Use every Nth frame" box →
+load & run analysis on button click → simulation summary metrics → 3D structure view +
+frame slider → the "RMSD reference frame" box (changing it recalculates only the RMSD) and
+the GROMACS-style-graphs checkbox → trajectory graph with click/range selection → two
+CSV download buttons → per-frame numbers → per-range averaged numbers. Errors while
+reading the files are shown with `st.error`.
 A file with only one frame (for example a plain PDB) gets no frame slider, because
 Streamlit does not allow a slider whose minimum equals its maximum; a caption says
-that only frame 0 exists. Tests: `test_frames.py`.
+that only frame 0 exists.
 Called directly at module level (`main()`), which is how a Streamlit script
 executes top-to-bottom on every rerun
 (https://docs.streamlit.io/develop/concepts/architecture/run-your-app).

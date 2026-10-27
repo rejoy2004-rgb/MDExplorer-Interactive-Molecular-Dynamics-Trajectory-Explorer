@@ -88,60 +88,78 @@ def show_secondary_structure(dssp, frame):
     return "- Helix: %.0f%%\n- Sheet: %.0f%%\n- Coil: %.0f%%" % (helix, sheet, coil)
 
 
-def make_plot(system, results, frame, metric):
-    """Build the Plotly graph for whichever metric the user picked."""
-    frames = np.arange(system.n_frames)
+def make_plot(system, results, frame, metric, x_values, gromacs_units, rmsd_reference):
+    """Build the Plotly graph for whichever metric the user picked.
+
+    x_values is what the frame axis shows: the frame numbers, or the time of each frame in ns.
+    gromacs_units shows distances in nm (1 nm = 10 A) like GROMACS does, instead of A."""
+    scale = 0.1 if gromacs_units else 1.0
+    unit = "nm" if gromacs_units else "A"
+    x_title = "Time (ns)" if gromacs_units else "Frame"
 
     # RMSF has one value per alpha carbon, so label its bars with that residue's number
     if results["rmsf"] is not None:
-        residues = system.resids[system.select(["CA"])]
-        if len(residues) != len(results["rmsf"]):
+        numbers = system.resids[system.select(["CA"])]
+        if len(numbers) != len(results["rmsf"]):
             raise ValueError("Got %d residue numbers but %d RMSF values."
-                             % (len(residues), len(results["rmsf"])))
+                             % (len(numbers), len(results["rmsf"])))
+
+        if len(set(numbers.tolist())) == len(numbers):
+            residues = numbers
+            residue_axis = "Residue number"
+        else:
+            # chains that reuse residue numbers would stack their bars, so plot in file order
+            residues = np.arange(1, len(numbers) + 1)
+            residue_axis = "Residue position in the file (residue numbers repeat across chains)"
+        rmsf = np.array(results["rmsf"]) * scale
+        rmsf_bars = dict(x=residues, y=rmsf, customdata=numbers,
+                         hovertemplate="residue number %{customdata}<br>RMSF %{y:.3f} " + unit + "<extra></extra>")
 
     # RMSF is different from the others, it is per residue and not per frame
     if metric == "RMSF":
-        figure = go.Figure(go.Bar(x=residues, y=results["rmsf"]))
-        figure.update_layout(xaxis_title="Residue number", yaxis_title="RMSF (A)", height=350)
+        figure = go.Figure(go.Bar(**rmsf_bars))
+        figure.update_layout(xaxis_title=residue_axis, yaxis_title="RMSF (" + unit + ")", height=350)
         return figure
 
     # all three metrics under each other, for comparing them
     if metric == "All":
         figure = make_subplots(rows=3, subplot_titles=("RMSD", "RMSF", "Rg"))
         if results["rmsd"] is not None:
-            figure.add_trace(go.Scatter(x=frames, y=results["rmsd"], name="RMSD"), row=1, col=1)
+            figure.add_trace(go.Scatter(x=x_values, y=np.array(results["rmsd"]) * scale, name="RMSD"), row=1, col=1)
         if results["rmsf"] is not None:
-            figure.add_trace(go.Bar(x=residues, y=results["rmsf"], name="RMSF"), row=2, col=1)
+            figure.add_trace(go.Bar(name="RMSF", **rmsf_bars), row=2, col=1)
         if results["rg"] is not None:
-            figure.add_trace(go.Scatter(x=frames, y=results["rg"], name="Rg"), row=3, col=1)
+            figure.add_trace(go.Scatter(x=x_values, y=np.array(results["rg"]) * scale, name="Rg"), row=3, col=1)
         figure.update_layout(height=700)
         return figure
 
     if metric == "RMSD":
-        values = results["rmsd"]
+        values = np.array(results["rmsd"]) * scale
+        y_title = "RMSD vs frame %d (%s)" % (rmsd_reference, unit)
     else:
-        values = results["rg"]
+        values = np.array(results["rg"]) * scale
+        y_title = "Rg (" + unit + ")"
 
     figure = go.Figure()
     figure.add_trace(go.Scatter(
-        x=frames, y=values, mode="lines+markers", name=metric,
+        x=x_values, y=values, mode="lines+markers", name=metric,
         # markers give clicks something to hit; a plain line has no target
         marker=dict(size=5, opacity=0.15),
     ))
 
     # a red line showing which frame is on screen in the 3D viewer
-    figure.add_vline(x=frame, line_color="red", line_dash="dash", opacity=0.6)
+    figure.add_vline(x=x_values[frame], line_color="red", line_dash="dash", opacity=0.6)
 
     # a shaded band if the user has selected a range of frames
     if st.session_state["selected_range"] is not None:
         start, end = st.session_state["selected_range"]
-        figure.add_vrect(x0=start, x1=end, fillcolor="lightblue", opacity=0.2, line_width=0)
+        figure.add_vrect(x0=x_values[start], x1=x_values[end], fillcolor="lightblue", opacity=0.2, line_width=0)
 
-    figure.update_layout(xaxis_title="Frame", yaxis_title=metric + " (A)", height=350)
+    figure.update_layout(xaxis_title=x_title, yaxis_title=y_title, height=350)
     return figure
 
 
-def handle_click(event, n_frames):
+def handle_click(event, x_values):
     """Jump to the clicked frame, or select a dragged range."""
     if event is None:
         return
@@ -150,12 +168,12 @@ def handle_click(event, n_frames):
     if len(points) == 0:
         return
 
-    # the frame number is the x value of the point that was clicked
-    clicked = sorted(set(int(point["x"]) for point in points))
+    # a point's x is a frame number or a time; find which frame it belongs to
+    clicked = sorted(set(int(np.argmin(np.abs(x_values - point["x"]))) for point in points))
 
     # slider's already drawn this run, so stash the value for next run
     if len(clicked) == 1:
-        st.session_state["new_frame"] = min(clicked[0], n_frames - 1)
+        st.session_state["new_frame"] = clicked[0]
         st.session_state["selected_range"] = None
     else:
         st.session_state["selected_range"] = (clicked[0], clicked[-1])
@@ -178,6 +196,11 @@ def main():
             "Trajectory file (DCD, XTC, TRR, NC)",
             type=[extension[1:] for extension in TRAJECTORY_FORMATS],
         )
+        stride = st.number_input(
+            "Use every Nth frame", min_value=1, value=1, step=1,
+            help="Long trajectories are slow: on one test PC a 7,000-atom protein needed about 3 s per "
+                 "frame for SASA and 0.4 s for hydrogen bonds. 1 = every frame, 100 = every 100th frame.",
+        )
         load_clicked = st.button("Load simulation")
 
     if load_clicked:
@@ -190,13 +213,15 @@ def main():
 
         try:
             with st.spinner("Reading the files and running the analysis..."):
-                system = load_simulation(top_path, traj_path)
+                system = load_simulation(top_path, traj_path, int(stride))
                 results, errors = run_all_analysis(system)
 
             # session_state survives reruns, so we don't reload on every click
             st.session_state["system"] = system
             st.session_state["results"] = results
             st.session_state["errors"] = errors
+            st.session_state["rmsd_reference"] = 0          # the frame the stored RMSD is measured against
+            st.session_state["rmsd_reference_input"] = 0    # what the reference box shows
             st.session_state["periodic"] = analysis.check_periodic_split(system)
             st.session_state["frame"] = 0
             st.session_state["selected_range"] = None
@@ -241,6 +266,9 @@ def main():
     col2.metric("Residues", "{:,}".format(system.n_residues))
     col3.metric("Frames", "{:,}".format(system.n_frames))
     col4.metric("Length", "%.1f ps" % system.time[-1])
+    if system.stride > 1:
+        st.caption("Frames were skipped: 1 frame in every %d of the file was loaded (frames 0, %d, %d, ...); "
+                   "times are those of the original file." % (system.stride, system.stride, 2 * system.stride))
 
     # warn before the numbers are read if the protein may be cut by the box edge
     if "periodic" in st.session_state:
@@ -277,6 +305,26 @@ def main():
 
     # --- the graph ---
     st.subheader("Trajectory analysis")
+
+    # RMSD is measured against frame 0 unless the user picks another frame
+    if results["rmsd"] is not None and system.n_frames > 1:
+        reference = int(st.number_input(
+            "RMSD reference frame", min_value=0, max_value=system.n_frames - 1, step=1,
+            key="rmsd_reference_input",
+            help="Every frame is compared with this one, so its RMSD is 0."))
+        if reference != st.session_state.get("rmsd_reference", 0):
+            with st.spinner("Recalculating RMSD..."):
+                results["rmsd"] = analysis.calculate_rmsd(system, reference)
+            st.session_state["rmsd_reference"] = reference
+    rmsd_reference = st.session_state.get("rmsd_reference", 0)
+
+    # GROMACS plots time in ns and distances in nm; the numbers below the graph stay in ps and A
+    gromacs_units = st.checkbox("GROMACS-style graphs (time in ns, distances in nm)")
+    if gromacs_units:
+        x_values = system.time / 1000
+    else:
+        x_values = np.arange(system.n_frames)
+
     choices = []
     for name, label in [("rmsd", "RMSD"), ("rmsf", "RMSF"), ("rg", "Rg")]:
         if results[name] is not None:
@@ -287,7 +335,7 @@ def main():
     else:
         choices.append("All")
         metric = st.radio("Metric", choices, horizontal=True)
-        figure = make_plot(system, results, frame, metric)
+        figure = make_plot(system, results, frame, metric, x_values, gromacs_units, rmsd_reference)
 
         # the RMSD and Rg graphs can be clicked to change the frame
         if metric == "RMSD" or metric == "Rg":
@@ -300,9 +348,17 @@ def main():
                 selection_mode=["points", "box", "lasso"],
                 key="graph",
             )
-            handle_click(event, system.n_frames)
+            handle_click(event, x_values)
         else:
             st.plotly_chart(figure, key="graph")
+
+    # --- the results as files, for plotting in other programs ---
+    st.subheader("Download the results")
+    col1, col2 = st.columns(2)
+    col1.download_button("Per-frame values (CSV)", analysis.per_frame_csv(system, results),
+                         file_name="mdexplorer_per_frame.csv", mime="text/csv")
+    col2.download_button("RMSF of each residue (CSV)", analysis.rmsf_csv(system, results),
+                         file_name="mdexplorer_rmsf.csv", mime="text/csv", disabled=results["rmsf"] is None)
 
     # --- the numbers for the frame that is on screen ---
     st.subheader("This frame")
