@@ -28,9 +28,10 @@ def save_upload(uploaded_file):
     return path
 
 
-def run_all_analysis(system):
+def run_all_analysis(system, with_sasa=True):
     """Run every measurement. If one fails, its result is None (shown as "Not
-    available") and the reason is kept in errors so the page can explain it."""
+    available") and the reason is kept in errors so the page can explain it.
+    SASA is by far the slowest, so the user can leave it out."""
     to_run = {
         "rmsd": analysis.calculate_rmsd,
         "rmsf": analysis.calculate_rmsf,
@@ -44,6 +45,10 @@ def run_all_analysis(system):
     results = {}
     errors = {}
     for name in to_run:
+        if name == "sasa" and not with_sasa:
+            results[name] = None
+            errors[name] = "Skipped: 'Calculate SASA' was not ticked (it is the slowest measurement)."
+            continue
         try:
             results[name] = to_run[name](system)
         except Exception as error:
@@ -201,6 +206,11 @@ def main():
             help="Long trajectories are slow: on one test PC a 7,000-atom protein needed about 3 s per "
                  "frame for SASA and 0.4 s for hydrogen bonds. 1 = every frame, 100 = every 100th frame.",
         )
+        with_sasa = st.checkbox(
+            "Calculate SASA (slow)", value=False,
+            help="About 3 s per frame for a 7,000-atom protein. Leave it off for a quick first look, "
+                 "then reload with it ticked and a larger 'every Nth frame'.",
+        )
         load_clicked = st.button("Load simulation")
 
     if load_clicked:
@@ -214,7 +224,7 @@ def main():
         try:
             with st.spinner("Reading the files and running the analysis..."):
                 system = load_simulation(top_path, traj_path, int(stride))
-                results, errors = run_all_analysis(system)
+                results, errors = run_all_analysis(system, with_sasa)
 
             # session_state survives reruns, so we don't reload on every click
             st.session_state["system"] = system
