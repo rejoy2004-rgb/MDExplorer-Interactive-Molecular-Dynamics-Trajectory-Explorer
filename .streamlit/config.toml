@@ -1,0 +1,3 @@
+[server]
+# Streamlit's default upload limit is 200 MB; MD trajectories are often bigger.
+maxUploadSize = 2000
