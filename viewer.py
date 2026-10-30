@@ -46,7 +46,7 @@ def make_pdb_text(system, frame):
     return "\n".join(lines)
 
 
-def render_structure(system, frame, width=900, height=520):
+def render_structure(system, frame, width=900, height=520, high_quality=False):
     """Render the protein as a rainbow coloured cartoon and return PNG bytes."""
     with _pymol_lock:
         cmd.reinitialize()
@@ -58,5 +58,6 @@ def render_structure(system, frame, width=900, height=520):
         cmd.bg_color("white")
         cmd.orient()
 
-        cmd.ray(width, height)
-        return cmd.png(None, width=width, height=height, dpi=150)
+        # cmd.png(..., ray=1) already ray-traces internally, so a separate cmd.ray()
+        # call before it would ray-trace the same image twice for no benefit.
+        return cmd.png(None, width=width, height=height, dpi=150, ray=1 if high_quality else 0)

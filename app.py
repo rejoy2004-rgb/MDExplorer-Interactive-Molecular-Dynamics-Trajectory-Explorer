@@ -28,7 +28,7 @@ def save_upload(uploaded_file):
     return path
 
 
-def run_all_analysis(system, with_sasa=True):
+def run_all_analysis(system, with_sasa=True, sasa_points=960):
     """Run every measurement. If one fails, its result is None (shown as "Not
     available") and the reason is kept in errors so the page can explain it.
     SASA is by far the slowest, so the user can leave it out."""
@@ -50,7 +50,10 @@ def run_all_analysis(system, with_sasa=True):
             errors[name] = "Skipped: 'Calculate SASA' was not ticked (it is the slowest measurement)."
             continue
         try:
-            results[name] = to_run[name](system)
+            if name == "sasa":
+                results[name] = analysis.calculate_sasa(system, sasa_points)
+            else:
+                results[name] = to_run[name](system)
         except Exception as error:
             results[name] = None
             errors[name] = type(error).__name__ + ": " + str(error)
@@ -208,9 +211,15 @@ def main():
         )
         with_sasa = st.checkbox(
             "Calculate SASA (slow)", value=False,
-            help="About 3 s per frame for a 7,000-atom protein. Leave it off for a quick first look, "
-                 "then reload with it ticked and a larger 'every Nth frame'.",
+            help="Leave it off for a quick first look, then reload with it ticked and a larger "
+                 "'every Nth frame'.",
         )
+        fast_sasa = st.checkbox(
+            "Fast SASA (100 points per atom)", value=True,
+            help="About 5x faster than the full 960 points; the area comes out about 0.5% different. "
+                 "Untick it for the most precise values.",
+        )
+        hq_render = st.checkbox("High quality render", value=False, help="Ray-traced render (slow).")
         load_clicked = st.button("Load simulation")
 
     if load_clicked:
@@ -224,7 +233,7 @@ def main():
         try:
             with st.spinner("Reading the files and running the analysis..."):
                 system = load_simulation(top_path, traj_path, int(stride))
-                results, errors = run_all_analysis(system, with_sasa)
+                results, errors = run_all_analysis(system, with_sasa, 100 if fast_sasa else 960)
 
             # session_state survives reruns, so we don't reload on every click
             st.session_state["system"] = system
@@ -306,7 +315,7 @@ def main():
     # --- the 3D view ---
     st.subheader("3D structure")
     st.caption("Frame %d, at %.1f ps" % (frame, system.time[frame]))
-    st.image(render_structure(system, frame))
+    st.image(render_structure(system, frame, high_quality=hq_render))
     if system.n_frames > 1:
         st.slider("Frame", min_value=0, max_value=system.n_frames - 1, key="frame")
     else:
@@ -404,4 +413,6 @@ def main():
         col2.metric("Highest RMSD", show_number(max(rmsd_values), "A"))
 
 
-main()
+# SASA worker processes re-import this file on Windows; without this guard each would run the whole app
+if __name__ == "__main__":
+    main()

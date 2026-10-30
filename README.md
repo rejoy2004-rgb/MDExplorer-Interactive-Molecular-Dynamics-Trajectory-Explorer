@@ -43,7 +43,7 @@ solvent box around the protein would dominate the results.
 | Radius of gyration | how compact the folded protein is | our own Python code, mass weighted |
 | Centre of mass | whether the protein is drifting through the box | our own Python code |
 | Hydrogen bonds | whether the folded structure is holding together | our own Python code, the Baker-Hubbard geometric rule: H...acceptor under 2.5 A and a donor-H...acceptor angle over 120 degrees |
-| SASA | how much surface is exposed to water | mdtraj (Shrake-Rupley) |
+| SASA | how much surface is exposed to water | freesasa (Shrake-Rupley, 960 points per atom, or 100 for the faster option) |
 | Secondary structure | the helix / sheet / coil percentages | mdtraj (DSSP, simplified 3-class output: H, E, C) |
 
 The last two use a library because the algorithms behind them are much bigger
@@ -99,6 +99,11 @@ in ns and distances in nm. Here frame 30 is the reference, so the curve reaches 
 at frame 30.
 
 ![RMSD against frame 30 with time in ns and distance in nm](screenshots/06_gromacs_units_and_reference.png)
+
+The sidebar has two SASA tick boxes. **Calculate SASA** turns it on; **Fast SASA** (on by default) uses
+100 sphere points per atom instead of 960, about 5x faster:
+
+![The sidebar with the Calculate SASA and Fast SASA tick boxes, and the 3D structure](screenshots/07_fast_sasa_option.png)
 
 **Periodic-boundary warning.** This raw GROMACS output (`adk_oplsaa.gro` +
 `adk_oplsaa.xtc`) has the protein cut by the edge of the simulation box, which is
@@ -180,8 +185,8 @@ the same coordinates, atoms, reference frame and units for both tools.
 For that protein MDExplorer finds an RMSD that rises to 1.39 nm, a radius of gyration
 falling from 3.11 to 2.70 nm, and the largest fluctuation (1.92 nm) at residue 430 in the
 flexible C-terminal end. Loading all 10,001 frames takes 9 s and 0.9 GB. All seven measurements
-for every 100th frame (101 frames) took about 6.5 minutes, nearly all of it SASA (about 3 s
-per frame; hydrogen bonds about 0.4 s per frame).
+for all 10,001 frames took about 220 seconds with Fast SASA, about 70% of it SASA (157 s;
+hydrogen bonds 12 s).
 
 **GROMACS itself was not installed on the development computer**, so the "as GROMACS
 defines it" row is MDAnalysis using GROMACS's definitions, not GROMACS's own output. To finish
@@ -207,8 +212,9 @@ differ even when both programs are right:
 **The sample protein** (Adenylate Kinase from the MDAnalysis test files, 98 frames):
 RMSD, RMSF, radius of gyration and centre of mass agree with MDAnalysis to 1e-6 A; the Kabsch
 alignment agrees with SciPy on 200 random cases (including mirror images); hydrogen-bond counts
-are identical to mdtraj's Baker-Hubbard on all 98 frames; SASA of a single isolated carbon is
-120.76 A^2, the analytic value; secondary structure agrees with MDAnalysis' own DSSP for 96.6%
+are identical to mdtraj's Baker-Hubbard on all 98 frames (and to the earlier, slower version of
+this code); SASA from freesasa is within 0.03 to 0.74% of mdtraj's on five frames (freesasa uses
+different atomic radii); secondary structure agrees with MDAnalysis' own DSSP for 96.6%
 of residues.
 
 **File formats.** All seven measurements ran on every combination tried:
@@ -230,8 +236,10 @@ to `.nc`.
 all number their residues from 1). It has 102 residues (not 30), the periodic-boundary check does
 not compare across chains, and the RMSF graph draws 102 separate bars in file order with the
 real residue number on hover. This crystal structure also has two atoms at exactly the same
-position (Val 12, `CG1` and `CG2`): mdtraj's SASA code would stop the whole program, so MDExplorer
-reports it as an error for SASA only and everything else still works.
+position (Val 12, `CG1` and `CG2`). freesasa does not stop or raise an error for such atoms (tested
+with a small made-up set of coordinates, not with the 4INS file itself), but the duplicated
+atoms hide each other, so the total comes out too low (221 instead of 252 A^2 in that small test).
+For a whole protein the effect of one pair is tiny, but MDExplorer does not warn about it.
 
 ## Known limitations
 
@@ -242,23 +250,20 @@ reports it as an error for SASA only and everything else still works.
 * RMSD uses the backbone N, CA, C, O, unweighted, and always compares with a frame
   of the loaded file (frame 0 unless you pick another). The RMSF is always fitted to
   frame 0. GROMACS's defaults differ slightly (see Validation).
-* SASA is skipped, with a message, for a structure that has two atoms at exactly the
-  same position.
+* SASA is the slowest measurement. It uses freesasa, one frame per call, spread over up to 6
+  CPU cores (more cores were slower on the test PC). The tick box **Fast SASA** uses 100 sphere
+  points per atom instead of 960: about 5x faster, area about 0.5% different.
 * An atom whose element cannot be guessed from its name (MDExplorer takes the first
-  letter) stops SASA and secondary structure with an error message. Protein-only files
+  letter) stops secondary structure with an error message. Protein-only files
   are fine; a metal or an unusual ligand may not be.
 * Streamlit's upload limit is raised to 2,000 MB in `.streamlit/config.toml`; a bigger
   trajectory has to be shortened first (for example `gmx trjconv -dt`).
 * Loading time depends on the number of frames, the number of atoms and your
-  computer. SASA is the slowest measurement because it is deliberately run on
-  one thread, one frame at a time: mdtraj's multi-threaded version sometimes
-  returned a wrong value for a frame when the computer was busy, and it made
-  every frame after the first about 0.1% too large. Example from one machine (a
-  Windows PC with 12 logical cores, Adenylate Kinase with 3,341 protein atoms):
-  SASA took about 0.6 s per frame (98 frames in about 60 s) and hydrogen bonds
-  about 0.1 s per frame. For a 7,148-atom protein SASA took about 3 s per frame.
-  These are examples, not guarantees; a long trajectory can take hours, so use
-  **Use every Nth frame**.
+  computer. Example from one Windows PC with 12 logical cores: a 7,148-atom protein,
+  10,001 frames, every frame, took about 220 s in total with Fast SASA (SASA about 157 s,
+  hydrogen bonds 12 s, secondary structure 23 s, loading 5 s). A 3,341-atom protein took
+  about 0.14 s per frame for SASA at 960 points on one core. These are examples, not
+  guarantees; use **Use every Nth frame** to cut the time further.
 
 ## Libraries used
 
@@ -266,7 +271,8 @@ reports it as an error for SASA only and everything else still works.
 | --- | --- |
 | MDAnalysis | opening the simulation files |
 | NumPy | all the arrays and most of the maths |
-| mdtraj | SASA and DSSP |
+| freesasa | SASA |
+| mdtraj | DSSP (secondary structure) |
 | Streamlit | the web page |
 | Plotly | the graphs |
 | PyMOL (pymol-open-source-whl) | the 3D view |

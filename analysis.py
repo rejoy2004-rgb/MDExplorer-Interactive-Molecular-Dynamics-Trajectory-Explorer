@@ -2,21 +2,16 @@
 
 Plain lists and loops throughout, except superimpose() which still uses
 NumPy's SVD once (real linear algebra, not reimplemented) and SASA/DSSP
-which still come from mdtraj (large, established algorithms). Water and
+which come from freesasa and mdtraj (large, established algorithms). Water and
 ions are excluded everywhere.
 """
 
 import csv
 import io
-import math
-import os
-
-# mdtraj's multi-threaded SASA sometimes returns a wrong area for a frame when
-# the CPU is busy; one thread was reliable. Must be set before mdtraj is imported.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import mdtraj as md
 import numpy as np
+from scipy.spatial import cKDTree
 
 # the four atoms that make up the protein backbone
 BACKBONE = ["N", "CA", "C", "O"]
@@ -104,18 +99,6 @@ def frame_positions(system, frame_index, atom_indices):
     return points
 
 
-def mean_center(points):
-    """Move a list of points so their average position sits at the origin."""
-    n = len(points)
-    total = [0.0, 0.0, 0.0]
-    for p in points:
-        total[0] += p[0]
-        total[1] += p[1]
-        total[2] += p[2]
-    average = [total[0] / n, total[1] / n, total[2] / n]
-    return [[p[0] - average[0], p[1] - average[1], p[2] - average[2]] for p in points]
-
-
 def transpose3(m):
     """Flip a 3x3 matrix's rows and columns."""
     result = [[0.0, 0.0, 0.0] for _ in range(3)]
@@ -191,24 +174,31 @@ def calculate_rmsd(system, reference_frame=0):
     if not 0 <= reference_frame < system.n_frames:
         raise ValueError("The reference frame must be between 0 and %d." % (system.n_frames - 1))
 
-    # the reference frame is what everything is compared against
-    reference = mean_center(frame_positions(system, reference_frame, atoms))
+    coords = system.coordinates[:, atoms, :].astype(float)   # (F, A, 3)
+    n_frames = coords.shape[0]
+    n_atoms = coords.shape[1]
 
-    rmsd = []
-    for i in range(system.n_frames):
-        frame = mean_center(frame_positions(system, i, atoms))
-        frame = superimpose(frame, reference)
+    reference = coords[reference_frame]                      # (A, 3)
+    mobile_c = coords - coords.mean(axis=1, keepdims=True)  # (F, A, 3)
+    ref_c = reference - reference.mean(axis=0, keepdims=True)  # (A, 3)
 
-        # root mean square of the per-atom distance
-        total = 0.0
-        for a in range(len(atoms)):
-            dx = frame[a][0] - reference[a][0]
-            dy = frame[a][1] - reference[a][1]
-            dz = frame[a][2] - reference[a][2]
-            total += dx * dx + dy * dy + dz * dz
-        rmsd.append(math.sqrt(total / len(atoms)))
+    # per-frame 3x3 covariance
+    cov = np.einsum("fai,aj->fij", mobile_c, ref_c)         # (F, 3, 3)
 
-    return rmsd
+    # Kabsch: SVD per frame, then determinant correction
+    u, _, vt = np.linalg.svd(cov)                           # (F,3,3),(F,3,3)
+    det_val = np.linalg.det(np.einsum("fij,fjk->fik", vt.transpose(0, 2, 1), u.transpose(0, 2, 1)))
+    d = np.where(det_val >= 0, 1.0, -1.0)
+
+    correction = np.tile(np.eye(3)[None, :, :], (n_frames, 1, 1))
+    correction[:, 2, 2] = d
+
+    rot = vt.transpose(0, 2, 1) @ correction @ u.transpose(0, 2, 1)   # (F,3,3)
+
+    rotated = np.einsum("fij,faj->fai", rot, mobile_c)      # (F, A, 3)
+    diff = rotated - ref_c[None, :, :]
+    rmsd = np.sqrt((diff * diff).sum(axis=(1, 2)) / n_atoms)
+    return rmsd.tolist()
 
 
 def calculate_rmsf(system):
@@ -217,85 +207,61 @@ def calculate_rmsf(system):
     if len(atoms) == 0:
         raise ValueError("No alpha carbon (CA) atoms were found in this file.")
 
-    # align first, like RMSD, so drift isn't mistaken for fluctuation
-    reference = mean_center(frame_positions(system, 0, atoms))
+    coords = system.coordinates[:, atoms, :].astype(float)   # (F, A, 3)
+    n_frames = coords.shape[0]
 
-    aligned = []
-    for i in range(system.n_frames):
-        frame = mean_center(frame_positions(system, i, atoms))
-        aligned.append(superimpose(frame, reference))
+    reference = coords[0]
+    mobile_c = coords - coords.mean(axis=1, keepdims=True)
+    ref_c = reference - reference.mean(axis=0, keepdims=True)
 
-    n_atoms = len(atoms)
-    n_frames = system.n_frames
+    cov = np.einsum("fai,aj->fij", mobile_c, ref_c)
+    u, _, vt = np.linalg.svd(cov)
+    det_val = np.linalg.det(np.einsum("fij,fjk->fik", vt.transpose(0, 2, 1), u.transpose(0, 2, 1)))
+    d = np.where(det_val >= 0, 1.0, -1.0)
+    correction = np.tile(np.eye(3)[None, :, :], (n_frames, 1, 1))
+    correction[:, 2, 2] = d
+    rot = vt.transpose(0, 2, 1) @ correction @ u.transpose(0, 2, 1)
 
-    # the average position of each residue over the whole simulation
-    average = []
-    for a in range(n_atoms):
-        total = [0.0, 0.0, 0.0]
-        for i in range(n_frames):
-            total[0] += aligned[i][a][0]
-            total[1] += aligned[i][a][1]
-            total[2] += aligned[i][a][2]
-        average.append([total[0] / n_frames, total[1] / n_frames, total[2] / n_frames])
+    aligned = np.einsum("fij,faj->fai", rot, mobile_c)      # (F, A, 3)
 
-    # how far each residue is from its own average position, on average
-    rmsf = []
-    for a in range(n_atoms):
-        total = 0.0
-        for i in range(n_frames):
-            dx = aligned[i][a][0] - average[a][0]
-            dy = aligned[i][a][1] - average[a][1]
-            dz = aligned[i][a][2] - average[a][2]
-            total += dx * dx + dy * dy + dz * dz
-        rmsf.append(math.sqrt(total / n_frames))
-
-    return rmsf
+    average = aligned.mean(axis=0)                          # (A, 3)
+    diff = aligned - average[None, :, :]
+    rmsf = np.sqrt((diff * diff).sum(axis=2).mean(axis=0))
+    return rmsf.tolist()
 
 
 def center_of_mass(system):
     """Mass-weighted centre of mass of the protein, one [x, y, z] per frame."""
     mask = system.protein_mask()
-    atoms = [i for i in range(system.n_atoms) if mask[i]]
-    masses = [float(system.masses[i]) for i in atoms]
-    total_mass = sum(masses)
+    atoms = np.where(mask)[0]
+    if len(atoms) == 0:
+        raise ValueError("No protein atoms were found in this file.")
+    masses = system.masses[atoms].astype(float)
+    total_mass = masses.sum()
 
-    com = []
-    for i in range(system.n_frames):
-        points = frame_positions(system, i, atoms)
-
-        # weight each atom's position by its mass
-        total = [0.0, 0.0, 0.0]
-        for a in range(len(atoms)):
-            total[0] += points[a][0] * masses[a]
-            total[1] += points[a][1] * masses[a]
-            total[2] += points[a][2] * masses[a]
-        com.append([total[0] / total_mass, total[1] / total_mass, total[2] / total_mass])
-
-    return com
+    coords = system.coordinates[:, atoms, :].astype(float)    # (F, A, 3)
+    # mass-weighted sum per frame
+    weighted = coords * masses[None, :, None]               # (F, A, 3)
+    com = weighted.sum(axis=1) / total_mass                 # (F, 3)
+    return com.tolist()
 
 
 def calculate_rg(system):
     """Radius of gyration (spread from the centre of mass) per frame."""
     mask = system.protein_mask()
-    atoms = [i for i in range(system.n_atoms) if mask[i]]
-    masses = [float(system.masses[i]) for i in atoms]
-    total_mass = sum(masses)
-    centres = center_of_mass(system)
+    atoms = np.where(mask)[0]
+    if len(atoms) == 0:
+        raise ValueError("No protein atoms were found in this file.")
+    masses = system.masses[atoms].astype(float)
+    total_mass = masses.sum()
 
-    rg = []
-    for i in range(system.n_frames):
-        points = frame_positions(system, i, atoms)
-
-        # mass-weighted root-mean-square distance from the centre
-        total = 0.0
-        for a in range(len(atoms)):
-            dx = points[a][0] - centres[i][0]
-            dy = points[a][1] - centres[i][1]
-            dz = points[a][2] - centres[i][2]
-            total += masses[a] * (dx * dx + dy * dy + dz * dz)
-        rg.append(math.sqrt(total / total_mass))
-
-    return rg
+    coords = system.coordinates[:, atoms, :].astype(float)    # (F, A, 3)
+    com = center_of_mass(system)
+    com = np.array(com)                                     # (F, 3)
+    diff = coords - com[:, None, :]                         # (F, A, 3)
+    sq = (diff * diff).sum(axis=2)                          # (F, A)
+    rg = np.sqrt((masses[None, :] * sq).sum(axis=1) / total_mass)
+    return rg.tolist()
 
 
 def calculate_hbonds(system):
@@ -308,67 +274,52 @@ def calculate_hbonds(system):
         raise ValueError("No N-H or O-H donors were found in this file.")
 
     # find each hydrogen's own heavy atom once, from frame 0
-    hydrogen_points = frame_positions(system, 0, hydrogens)
-    heavy_points = frame_positions(system, 0, heavy)
+    hydrogen_points = np.array(frame_positions(system, 0, hydrogens))
+    heavy_points = np.array(frame_positions(system, 0, heavy))
+
+    # vectorized nearest-heavy search
+    diff = hydrogen_points[:, None, :] - heavy_points[None, :, :]   # (Hh, H, 3)
+    distances = np.linalg.norm(diff, axis=2)                       # (Hh, H)
+    nearest = distances.argmin(axis=1)
+    nearest_distance = distances[np.arange(len(hydrogens)), nearest]
 
     donor_h = []
     donor_heavy = []
     for h in range(len(hydrogens)):
-        nearest_distance = None
-        nearest_heavy = None
-        for a in range(len(heavy)):
-            dx = hydrogen_points[h][0] - heavy_points[a][0]
-            dy = hydrogen_points[h][1] - heavy_points[a][1]
-            dz = hydrogen_points[h][2] - heavy_points[a][2]
-            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
-            if nearest_distance is None or distance < nearest_distance:
-                nearest_distance = distance
-                nearest_heavy = heavy[a]
-
-        if nearest_distance < BOND_LENGTH:
+        if nearest_distance[h] < BOND_LENGTH:
             donor_h.append(hydrogens[h])
-            donor_heavy.append(nearest_heavy)
+            donor_heavy.append(heavy[nearest[h]])
 
     if len(donor_h) == 0:
         raise ValueError("Could not find any bonded N-H or O-H pairs.")
 
+    heavy_index_of = {atom: k for k, atom in enumerate(heavy)}
+    own_heavy = np.array([heavy_index_of[atom] for atom in donor_heavy])  # per donor H
+
+    coords = system.coordinates.astype(float)  # (F, N, 3)
+    donor_h = np.array(donor_h)
+    donor_heavy = np.array(donor_heavy)
+    heavy = np.array(heavy)
+
     counts = []
     for i in range(system.n_frames):
-        h_points = frame_positions(system, i, donor_h)
-        donor_points = frame_positions(system, i, donor_heavy)
-        acceptor_points = frame_positions(system, i, heavy)
+        h_pos = coords[i, donor_h, :]          # (D, 3)
+        donor_pos = coords[i, donor_heavy, :]   # (D, 3)
+        heavy_pos = coords[i, heavy, :]         # (H, 3)
 
-        count = 0
-        for d in range(len(donor_h)):
-            # direction from H to its donor, normalised (must point away from H)
-            bx = donor_points[d][0] - h_points[d][0]
-            by = donor_points[d][1] - h_points[d][1]
-            bz = donor_points[d][2] - h_points[d][2]
-            bond_length = math.sqrt(bx * bx + by * by + bz * bz)
-            bx, by, bz = bx / bond_length, by / bond_length, bz / bond_length
+        # only the few (H, acceptor) pairs closer than HBOND_DIST need an angle check
+        pairs = cKDTree(h_pos).query_ball_tree(cKDTree(heavy_pos), HBOND_DIST)
+        d_index = np.repeat(np.arange(len(pairs)), [len(p) for p in pairs])
+        a_index = np.array([k for p in pairs for k in p], dtype=int)
+        keep = a_index != own_heavy[d_index]   # an H cannot bond to its own donor
+        d_index, a_index = d_index[keep], a_index[keep]
 
-            for a in range(len(heavy)):
-                # a hydrogen cannot form a bond back to its own heavy atom
-                if heavy[a] == donor_heavy[d]:
-                    continue
-
-                ax = acceptor_points[a][0] - h_points[d][0]
-                ay = acceptor_points[a][1] - h_points[d][1]
-                az = acceptor_points[a][2] - h_points[d][2]
-                distance = math.sqrt(ax * ax + ay * ay + az * az)
-                if distance >= HBOND_DIST:
-                    continue
-
-                # angle at H between its own bond and the line to this acceptor
-                ax, ay, az = ax / distance, ay / distance, az / distance
-                cos_angle = bx * ax + by * ay + bz * az
-                cos_angle = max(-1.0, min(1.0, cos_angle))
-                angle = math.degrees(math.acos(cos_angle))
-
-                if angle > HBOND_ANGLE:
-                    count += 1
-
-        counts.append(count)
+        to_donor = donor_pos[d_index] - h_pos[d_index]
+        to_acceptor = heavy_pos[a_index] - h_pos[d_index]
+        norms = np.linalg.norm(to_donor, axis=1) * np.linalg.norm(to_acceptor, axis=1)
+        cos_angle = (to_donor * to_acceptor).sum(axis=1) / np.where(norms == 0, 1.0, norms)
+        angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+        counts.append(int((angle > HBOND_ANGLE).sum()))
 
     return counts
 
@@ -381,8 +332,8 @@ TERMINAL_OXYGEN = {"OT1": "O", "OC1": "O", "O1": "O", "OT2": "OXT", "OC2": "OXT"
 def mdtraj_protein(system):
     """The protein as an mdtraj trajectory (cached), built from the system's own arrays.
 
-    SASA and DSSP come from mdtraj, which only needs atom names, residues, elements and
-    coordinates. Building it from our arrays (not from the files) means they work for every
+    DSSP comes from mdtraj, which only needs atom names, residues, elements and
+    coordinates. Building it from our arrays (not from the files) means it works for every
     file format, including .tpr, which mdtraj cannot read."""
     if system.mdtraj_protein is not None:
         return system.mdtraj_protein
@@ -429,36 +380,11 @@ def mdtraj_protein(system):
     return system.mdtraj_protein
 
 
-def check_no_overlap(frame):
-    """mdtraj's SASA code stops the whole program (not just the calculation) if two atoms sit at
-    exactly the same position, so look for that first and raise an ordinary error instead."""
-    positions = np.round(frame.xyz[0], 5)
-    _, inverse, counts = np.unique(positions, axis=0, return_inverse=True, return_counts=True)
-    if (counts > 1).any():
-        group = np.where(inverse.ravel() == np.where(counts > 1)[0][0])[0]
-        atoms = " and ".join(str(frame.top.atom(i)) for i in group)
-        raise ValueError("Atoms %s are at exactly the same position, which mdtraj's SASA code "
-                         "cannot handle (it would stop the whole program). Fix or remove "
-                         "the overlapping atoms and reload." % atoms)
-
-
-def calculate_sasa(system):
-    """Total solvent accessible surface area per frame (mdtraj's Shrake-Rupley)."""
-    traj = mdtraj_protein(system)
-
-    # One frame per call: when given several frames, mdtraj does not clear its work
-    # buffer between them, so every frame after the first comes out about 0.1% too large.
-    areas = []
-    for i in range(traj.n_frames):
-        check_no_overlap(traj[i])
-
-        # per-atom area of this frame, converted to a plain list
-        per_atom = md.shrake_rupley(traj[i]).tolist()[0]
-
-        # sum per atom; convert mdtraj's nm2 to A2
-        areas.append(sum(per_atom) * 100)
-
-    return areas
+def calculate_sasa(system, n_points=960):
+    """Total solvent accessible surface area per frame, using freesasa (Shrake-Rupley,
+    hydrogens included). n_points = sphere points per atom: 960 is finest, 100 is ~5x faster."""
+    import sasa_freesasa
+    return sasa_freesasa.calculate_sasa_freesasa(system, n_points)
 
 
 def calculate_secondary_structure(system):
