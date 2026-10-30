@@ -38,8 +38,8 @@ since a total mass of zero would break center-of-mass and Rg later.
 so that residues of different chains are never compared. `n_residues` counts a new
 residue wherever the chain label, residue number or residue name changes, so chains that
 reuse residue numbers are counted separately (insulin, 4 chains of 21 and 30 residues
-numbered from 1, has 102 residues, not 30). The mdtraj copy of the protein used for SASA
-and DSSP is cached in `mdtraj_protein`; the system keeps no file paths.
+numbered from 1, has 102 residues, not 30). The mdtraj copy of the protein used for
+DSSP is cached in `mdtraj_protein`; the system keeps no file paths.
 
 ### `MolecularSystem.protein_mask(self)`
 Boolean mask, `True` for non-solvent atoms. Solvent residue names (water/ion
@@ -82,7 +82,7 @@ and lists on purpose (explainability), except two places that intentionally reus
 established, non-trivial algorithms rather than reinventing them:
 
 - **`numpy.linalg.svd`** inside `superimpose()` — the Kabsch alignment algorithm.
-- **mdtraj's `shrake_rupley`** (SASA) and **`compute_dssp`** (secondary structure)
+- **freesasa** (SASA) and **mdtraj's `compute_dssp`** (secondary structure)
   — both large, validated algorithms that are standard in the MD field rather than
   something to hand-roll.
 
@@ -97,7 +97,7 @@ References used:
   same criterion as implemented in MDAnalysis'
   `HydrogenBondAnalysis`: https://docs.mdanalysis.org/stable/documentation_pages/analysis/hydrogenbonds.html
 - Radius of gyration definition: https://docs.mdanalysis.org/stable/documentation_pages/analysis/lineardensity.html (Rg is a standard mass-weighted RMS-distance-from-COM quantity, also defined in any MD textbook, e.g. Frenkel & Smit, *Understanding Molecular Simulation*)
-- mdtraj `shrake_rupley` (SASA, Shrake–Rupley algorithm): https://www.mdtraj.org/1.9.8.dev0/api/generated/mdtraj.shrake_rupley.html
+- freesasa Python API (SASA, Shrake–Rupley algorithm): https://freesasa.github.io/python/functions.html
   (algorithm: A. Shrake, J.A. Rupley, *J. Mol. Biol.* 79 (1973))
 - mdtraj `compute_dssp` (DSSP secondary structure assignment): https://www.mdtraj.org/1.9.8.dev0/api/generated/mdtraj.compute_dssp.html
   (algorithm: W. Kabsch, C. Sander, *Biopolymers* 22 (1983))
@@ -131,11 +131,6 @@ trajectory and the same GROMACS trajectory after MDAnalysis unwrapping give
 Pulls out `[x, y, z]` for a set of atoms at one frame as plain Python lists
 (rather than NumPy arrays), since the rest of the module deliberately works in
 plain lists.
-
-### `mean_center(points)`
-Translates a point set so its centroid is at the origin — the first step of any
-structural alignment (Kabsch algorithm reference above requires both point sets
-pre-centered).
 
 ### `transpose3(m)`, `matmul3(a, b)`, `determinant3(m)`
 Hand-written 3×3 matrix transpose, multiply, and determinant — the small amount
@@ -189,32 +184,27 @@ once from frame 0 since covalent bonding doesn't change during a simulation.
 Builds the protein as an **mdtraj** trajectory (cached on the `system` object) from
 MDExplorer's own arrays: an `md.Topology` with one chain per run of residues (a new chain
 starts when the chain label changes or the residue number does not go up), one residue per
-run of atoms, atom names and elements, and the coordinates divided by 10 (Å to nm). SASA
-and DSSP are not hand-rolled here — they're taken directly from mdtraj's implementations —
-and because they now read our arrays, not the files, they work for every file format,
+run of atoms, atom names and elements, and the coordinates divided by 10 (Å to nm). DSSP
+is not hand-rolled here — it is taken directly from mdtraj's implementation —
+and because it reads our arrays, not the files, it works for every file format,
 including `.tpr`, which mdtraj cannot read. C-terminal oxygens named `OT1/OT2`, `OC1/OC2`
 or `O1/O2` (when the residue has no `O`) are renamed `O` and `OXT`, exactly as mdtraj's own
 file readers do, because DSSP needs an atom called `O`. Checked against the old file-based
-path: DSSP letters were identical on three datasets (0 of 2,634 residues differ) and SASA
-differed by at most 0.13 Å² out of about 10,000 (rounding). An atom whose element cannot be
+path: DSSP letters were identical on three datasets (0 of 2,634 residues differ). An atom whose element cannot be
 guessed from its name gives a clear error.
 
-### `calculate_sasa(system)`
-Total solvent accessible surface area per frame, from mdtraj's
-`shrake_rupley` (per-atom areas, in nm²), summed per frame and converted to Å²
-(`× 100`, since 1 nm² = 100 Å²). Reference: mdtraj `shrake_rupley` docs above.
-`shrake_rupley` is called once per frame, not once for the whole trajectory:
-in mdtraj 1.11.0 the work buffer is not cleared between the frames of one call,
-so every frame after the first came out about 0.1% too large (the same frame
-repeated in one call gave 10181.4 Å² for the first copy and 10191.3 Å² for the
-later ones). `analysis.py` also sets `OMP_NUM_THREADS=1` before importing
-mdtraj, because the multi-threaded version sometimes returned a wrong area for
-a frame when the CPU was busy. The cost is speed: on one test machine, about
-0.6 s per frame for a 3,341-atom protein and about 3 s per frame for a 7,148-atom one.
-`check_no_overlap` first looks for two atoms at exactly the same position (as in
-Val 12 of the crystal structure 4INS, where `CG1` and `CG2` coincide): mdtraj's C code
-answers that by stopping the whole Python process, which would take the web server down,
-so it is turned into an ordinary error message and SASA is skipped.
+### `calculate_sasa(system, n_points=960)`
+Total solvent accessible surface area per frame, in Å², from freesasa (Shrake–Rupley,
+hydrogens included); the work is in `sasa_freesasa.py`. The radius of every protein atom is
+looked up once from frame 0 (names and residues never change during a simulation), and each
+frame is then passed to `freesasa.calcCoord` as a flat list of coordinates plus those radii.
+Frames are spread over up to 6 worker processes (on a 12-core test PC, 6 was fastest and 12
+was slower than 4). `n_points` is the number of test points per atom sphere: 960 is the finest,
+100 (freesasa's default, the app's **Fast SASA** tick box) is about 5x faster and changes the
+area by about 0.5% (10,374 vs 10,424 Å² on one frame). Against mdtraj's `shrake_rupley` the
+totals agreed within 0.03–0.74% on five frames; freesasa uses different atomic radii. Speed on
+one test PC: about 0.14 s per frame per core at 960 points for 3,341 atoms; 10,001 frames of a
+7,148-atom protein took 157 s at 100 points.
 
 ### `calculate_secondary_structure(system)`
 Per-residue, per-frame DSSP letter codes from mdtraj's `compute_dssp`, called
@@ -371,7 +361,8 @@ executes top-to-bottom on every rerun
 | Library | Purpose | Docs |
 |---|---|---|
 | MDAnalysis | Parsing topology/trajectory files into a `Universe` | https://docs.mdanalysis.org/ |
-| mdtraj | SASA (Shrake–Rupley) and DSSP secondary structure | https://www.mdtraj.org/ |
+| freesasa | SASA (Shrake–Rupley) | https://freesasa.github.io/ |
+| mdtraj | DSSP secondary structure | https://www.mdtraj.org/ |
 | NumPy | Arrays, `linalg.svd` for the Kabsch rotation, `isin`/`where`/`isfinite` | https://numpy.org/doc/stable/ |
 | Streamlit | Web UI framework | https://docs.streamlit.io/ |
 | Plotly | Interactive charts (RMSD/RMSF/Rg) | https://plotly.com/python/ |

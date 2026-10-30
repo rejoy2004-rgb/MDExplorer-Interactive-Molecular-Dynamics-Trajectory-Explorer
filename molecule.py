@@ -63,7 +63,7 @@ class MolecularSystem:
         starts = (chain[1:] != chain[:-1]) | (number[1:] != number[:-1]) | (name[1:] != name[:-1])
         self.n_residues = 0 if len(number) == 0 else 1 + int(starts.sum())
 
-        # SASA and DSSP are done by mdtraj; analysis.mdtraj_protein() fills this in once and reuses it
+        # DSSP is done by mdtraj; analysis.mdtraj_protein() fills this in once and reuses it
         self.mdtraj_protein = None
 
     def protein_mask(self):
