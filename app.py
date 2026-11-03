@@ -58,7 +58,30 @@ def run_all_analysis(system, with_sasa=True, sasa_points=960):
             results[name] = None
             errors[name] = type(error).__name__ + ": " + str(error)
 
+    # numpy arrays, so reading a value for any frame later is an instant lookup
+    for name in results:
+        if results[name] is not None:
+            results[name] = np.array(results[name])
+
+    # RMSD against every possible reference frame (row r = RMSD of all frames vs frame r), so
+    # changing the reference box later is a lookup. Slow for many frames: use "every Nth frame".
+    results["rmsd_all"] = None
+    if results["rmsd"] is not None:
+        results["rmsd_all"] = np.array([analysis.calculate_rmsd(system, r) for r in range(system.n_frames)])
+
     return results, errors
+
+
+def prepare_everything(system, results, hq_render):
+    """Everything a click could need, made once while loading, so clicking only looks
+    values up: one 3D picture per frame and the two CSV files."""
+    images = []
+    progress = st.progress(0, text="Drawing the 3D structure of every frame...")
+    for frame in range(system.n_frames):
+        images.append(render_structure(system, frame, high_quality=hq_render))
+        progress.progress((frame + 1) / system.n_frames)
+    progress.empty()
+    return images, analysis.per_frame_csv(system, results), analysis.rmsf_csv(system, results)
 
 
 def show_number(value, unit=""):
@@ -210,16 +233,16 @@ def main():
                  "frame for SASA and 0.4 s for hydrogen bonds. 1 = every frame, 100 = every 100th frame.",
         )
         with_sasa = st.checkbox(
-            "Calculate SASA (slow)", value=False,
-            help="Leave it off for a quick first look, then reload with it ticked and a larger "
-                 "'every Nth frame'.",
+            "Calculate SASA (slow)", value=True,
+            help="Everything is calculated once, right after you click Load. Untick this for a "
+                 "quicker load without SASA, or raise 'every Nth frame'.",
         )
         fast_sasa = st.checkbox(
             "Fast SASA (100 points per atom)", value=True,
             help="About 5x faster than the full 960 points; the area comes out about 0.5% different. "
                  "Untick it for the most precise values.",
         )
-        hq_render = st.checkbox("High quality render", value=False, help="Ray-traced render (slow).")
+        hq_render = st.checkbox("High quality render", value=False, help="Ray-traced render (slow, done for every frame at load).")
         load_clicked = st.button("Load simulation")
 
     if load_clicked:
@@ -234,7 +257,11 @@ def main():
             with st.spinner("Reading the files and running the analysis..."):
                 system = load_simulation(top_path, traj_path, int(stride))
                 results, errors = run_all_analysis(system, with_sasa, 100 if fast_sasa else 960)
+                images, frame_csv, rmsf_text = prepare_everything(system, results, hq_render)
 
+            st.session_state["images"] = images
+            st.session_state["frame_csv"] = frame_csv
+            st.session_state["rmsf_csv"] = rmsf_text
             # session_state survives reruns, so we don't reload on every click
             st.session_state["system"] = system
             st.session_state["results"] = results
@@ -315,7 +342,7 @@ def main():
     # --- the 3D view ---
     st.subheader("3D structure")
     st.caption("Frame %d, at %.1f ps" % (frame, system.time[frame]))
-    st.image(render_structure(system, frame, high_quality=hq_render))
+    st.image(st.session_state["images"][frame])
     if system.n_frames > 1:
         st.slider("Frame", min_value=0, max_value=system.n_frames - 1, key="frame")
     else:
@@ -332,8 +359,8 @@ def main():
             key="rmsd_reference_input",
             help="Every frame is compared with this one, so its RMSD is 0."))
         if reference != st.session_state.get("rmsd_reference", 0):
-            with st.spinner("Recalculating RMSD..."):
-                results["rmsd"] = analysis.calculate_rmsd(system, reference)
+            results["rmsd"] = results["rmsd_all"][reference]
+            st.session_state["frame_csv"] = analysis.per_frame_csv(system, results)
             st.session_state["rmsd_reference"] = reference
     rmsd_reference = st.session_state.get("rmsd_reference", 0)
 
@@ -374,9 +401,9 @@ def main():
     # --- the results as files, for plotting in other programs ---
     st.subheader("Download the results")
     col1, col2 = st.columns(2)
-    col1.download_button("Per-frame values (CSV)", analysis.per_frame_csv(system, results),
+    col1.download_button("Per-frame values (CSV)", st.session_state["frame_csv"],
                          file_name="mdexplorer_per_frame.csv", mime="text/csv")
-    col2.download_button("RMSF of each residue (CSV)", analysis.rmsf_csv(system, results),
+    col2.download_button("RMSF of each residue (CSV)", st.session_state["rmsf_csv"],
                          file_name="mdexplorer_rmsf.csv", mime="text/csv", disabled=results["rmsf"] is None)
 
     # --- the numbers for the frame that is on screen ---
