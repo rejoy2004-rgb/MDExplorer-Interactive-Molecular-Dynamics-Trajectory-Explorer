@@ -3,17 +3,20 @@
 Start it from the terminal with:   streamlit run app.py
 """
 
+import base64
 import gc
 import os
 import tempfile
+import time
 
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 
 from molecule import load_simulation, TOPOLOGY_FORMATS, TRAJECTORY_FORMATS
-from viewer import render_structure
+from viewer import render_structure, pymol_3d_html, click_targets, COLOR_SCHEMES
 import analysis
 
 st.set_page_config(page_title="MDExplorer", layout="wide")
@@ -83,16 +86,19 @@ def run_all_analysis(system, with_sasa=True, sasa_points=960):
     return results, errors
 
 
-def prepare_everything(system, results, hq_render):
+def prepare_everything(system, results, hq_render, color_by):
     """Everything a click could need, made once while loading, so clicking only looks
     values up: one 3D picture per frame and the two CSV files."""
     images = []
+    pixels = []   # per frame, where each clickable atom sits in that frame's picture
     progress = st.progress(0, text="Drawing the 3D structure of every frame...")
     for frame in range(system.n_frames):
-        images.append(render_structure(system, frame, high_quality=hq_render))
+        png, where = render_structure(system, frame, high_quality=hq_render, color_by=color_by)
+        images.append(png)
+        pixels.append(where)
         progress.progress((frame + 1) / system.n_frames)
     progress.empty()
-    return images, analysis.per_frame_csv(system, results), analysis.rmsf_csv(system, results)
+    return images, pixels, analysis.per_frame_csv(system, results), analysis.rmsf_csv(system, results)
 
 
 def show_number(value, unit=""):
@@ -225,6 +231,56 @@ def make_plot(system, results, frame, metric, x_values, gromacs_units, rmsd_refe
     return figure
 
 
+def atom_name(system, i):
+    """How an atom is labelled in the 3D view, e.g. "A ALA 22 : CA" (chain, residue, atom)."""
+    return "%s %s %d : %s" % (system.segids[i], system.resnames[i], system.resids[i], system.names[i])
+
+
+def pymol_figure(system, frame, png, pixels):
+    """The PyMOL picture of one frame, with every clickable atom as an invisible point on top
+    of it (hover shows the atom), plus the labels and distance lines of the atoms picked so far.
+    pixels are where render_structure says each clickable atom sits in this picture."""
+    width, height = 900, 520   # the size render_structure draws at
+    targets = click_targets(system)
+    png = base64.b64encode(png).decode()
+
+    figure = go.Figure(go.Scatter(
+        x=pixels[:, 0], y=pixels[:, 1], mode="markers", marker=dict(size=10, opacity=0),
+        text=[atom_name(system, i) for i in targets], hovertemplate="%{text}<extra></extra>"))
+    figure.add_layout_image(source="data:image/png;base64," + png, xref="x", yref="y", x=0, y=0,
+                            sizex=width, sizey=height, sizing="stretch", layer="below")
+    figure.update_xaxes(range=[0, width], visible=False, fixedrange=True)
+    figure.update_yaxes(range=[height, 0], visible=False, fixedrange=True)   # picture y grows downwards
+    figure.update_layout(width=width, height=height, margin=dict(l=0, r=0, t=0, b=0), plot_bgcolor="black",
+                         dragmode=False, showlegend=False)
+
+    picked = st.session_state.get("picked_atoms", [])
+    for k in picked:
+        figure.add_annotation(x=pixels[k, 0], y=pixels[k, 1], yshift=14, text=atom_name(system, targets[k]),
+                              showarrow=False, font=dict(color="white", size=12), bgcolor="black")
+    # every two picked atoms: a yellow dashed line and their distance in this frame
+    for a, b in zip(picked[0::2], picked[1::2]):
+        figure.add_shape(type="line", x0=pixels[a, 0], y0=pixels[a, 1], x1=pixels[b, 0], y1=pixels[b, 1],
+                         line=dict(color="yellow", width=2, dash="dash"))
+        distance = np.linalg.norm(system.coordinates[frame][targets[a]] - system.coordinates[frame][targets[b]])
+        figure.add_annotation(x=(pixels[a, 0] + pixels[b, 0]) / 2, y=(pixels[a, 1] + pixels[b, 1]) / 2,
+                              text="%.1f" % distance, showarrow=False, font=dict(color="yellow", size=13))
+    return figure
+
+
+def handle_atom_click(event):
+    """Remember a clicked atom of the PyMOL picture. The chart keeps its selection across reruns,
+    so the same selection is only taken once."""
+    if event is None:
+        return
+    points = [point for point in event.selection["points"] if point["curve_number"] == 0]
+    if len(points) == 0 or points[0]["point_index"] == st.session_state.get("last_atom_click"):
+        return
+    st.session_state["last_atom_click"] = points[0]["point_index"]
+    st.session_state.setdefault("picked_atoms", []).append(points[0]["point_index"])
+    st.rerun()
+
+
 def show_torsions(results, labels, residue, frame, x_values, gromacs_units):
     """Left: phi and psi of one residue over the whole trajectory. Right: the Ramachandran
     plot (phi against psi) of every residue at the frame on screen, the chosen residue in red."""
@@ -323,6 +379,11 @@ def main():
                  "Untick it for the most precise values.",
         )
         hq_render = st.checkbox("High quality render", value=False, help="Ray-traced render (slow, done for every frame at load).")
+        color_by = st.selectbox(
+            "Colour the protein by", COLOR_SCHEMES,
+            help="Secondary structure: helices red, strands yellow, loops green (as PyMOL works them out). "
+                 "Rainbow: blue at the first residue to red at the last. Chain: one colour per chain. "
+                 "The pictures are drawn at load, so click Load simulation again after changing this.")
         load_clicked = st.button("Load simulation")
 
     if load_clicked:
@@ -337,9 +398,14 @@ def main():
             with st.spinner("Reading the files and running the analysis..."):
                 system = load_simulation(top_path, traj_path, int(stride))
                 results, errors = run_all_analysis(system, with_sasa, 100 if fast_sasa else 960)
-                images, frame_csv, rmsf_text = prepare_everything(system, results, hq_render)
+                images, pixels, frame_csv, rmsf_text = prepare_everything(system, results, hq_render, color_by)
+            st.session_state["color_by"] = color_by   # the free-rotation view uses the colours of the load
 
             st.session_state["images"] = images
+            st.session_state["pixels"] = pixels
+            st.session_state["picked_atoms"] = []
+            st.session_state.pop("last_atom_click", None)
+            st.session_state["clears"] = st.session_state.get("clears", 0) + 1   # fresh 3D chart, no old click
             st.session_state["frame_csv"] = frame_csv
             st.session_state["rmsf_csv"] = rmsf_text
             # session_state survives reruns, so we don't reload on every click
@@ -352,6 +418,7 @@ def main():
             st.session_state["frame"] = 0
             st.session_state["selected_range"] = None
             st.session_state.pop("torsion_residue", None)
+            st.session_state.pop("play_range", None)   # the old range may not fit the new file
         except ValueError as error:
             # our own checks in molecule.py, already worded for the user
             st.error(str(error))
@@ -422,10 +489,57 @@ def main():
 
     # --- the 3D view ---
     st.subheader("3D structure")
-    st.caption("Frame %d, at %.1f ps" % (frame, system.time[frame]))
-    st.image(st.session_state["images"][frame])
+    # placeholders, so playback can swap the picture and its caption in place
+    caption = st.empty()
+    picture = st.empty()
+    caption.caption("Frame %d, at %.1f ps" % (frame, system.time[frame]))
+    rotatable = st.checkbox(
+        "Free rotation (drag to rotate, scroll to zoom, right-drag to move)", value=True,
+        help="PyMOL's own 3D shapes, drawn in the browser, so it looks like the PyMOL picture. Click an "
+             "atom to label it; a second atom gives a yellow dashed line with the distance in A; click a "
+             "labelled atom again to clear. Labels are cleared when the frame changes. Untick for the "
+             "still PyMOL picture, which changes frame instantly and keeps labels across frames. "
+             "Free rotation needs internet in the browser.")
+    if rotatable:
+        st.caption("Drag to rotate, scroll to zoom. Click an atom to label it; click a second atom for "
+                   "the distance. Magenta dots mark the residues within 5 A of a ligand.")
+        with picture:
+            components.html(pymol_3d_html(system, frame, color_by=st.session_state.get("color_by", COLOR_SCHEMES[0])),
+                            height=520)
+    else:
+        st.caption("Click the cartoon or a ligand to label an atom; every second atom you click gets a "
+                   "yellow dashed line with the distance in A. The labels stay when you change frame, "
+                   "so you can watch a distance change. Magenta dots mark the residues within 5 A of a ligand.")
+        png, pixels = st.session_state["images"][frame], st.session_state["pixels"][frame]
+        with picture:
+            event = st.plotly_chart(pymol_figure(system, frame, png, pixels), on_select="rerun", selection_mode="points",
+                                    key="structure%d" % st.session_state.get("clears", 0),
+                                    config={"displayModeBar": False}, width=900)   # the picture's own size, unstretched
+        handle_atom_click(event)
+        if len(st.session_state.get("picked_atoms", [])) > 0 and st.button("Clear labels and distances"):
+            st.session_state["picked_atoms"] = []
+            # a new chart key starts with no selection, so the last click is not picked again
+            st.session_state["clears"] = st.session_state.get("clears", 0) + 1
+            st.rerun()
     if system.n_frames > 1:
         st.slider("Frame", min_value=0, max_value=system.n_frames - 1, key="frame")
+
+        # playback only shows the pictures drawn at load, so it needs no calculation
+        with st.expander("Play frames (watch the protein move)"):
+            first, last = st.slider("Play from frame ... to frame", 0, system.n_frames - 1,
+                                    (0, system.n_frames - 1), key="play_range")
+            speed = st.slider("Frames per second", 1, 30, 10, key="play_speed")
+            col1, col2 = st.columns(2)
+            play = col1.button("Play")
+            col2.button("Stop")   # any click reruns the page, which ends the playback loop
+            if play:
+                for f in range(first, last + 1):
+                    caption.caption("Playing: frame %d, at %.1f ps" % (f, system.time[f]))
+                    picture.image(st.session_state["images"][f])
+                    time.sleep(1 / speed)
+                # leave the slider on the frame the playback ended on
+                st.session_state["new_frame"] = last
+                st.rerun()
     else:
         # Streamlit does not allow a slider whose minimum equals its maximum
         st.caption("This file has only one frame, so only frame 0 is available.")
