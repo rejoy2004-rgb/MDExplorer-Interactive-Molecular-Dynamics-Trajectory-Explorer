@@ -201,12 +201,9 @@ def calculate_rmsd(system, reference_frame=0):
     return rmsd.tolist()
 
 
-def calculate_rmsf(system):
-    """RMSF (fluctuation) of each residue's alpha carbon, over the whole simulation."""
-    atoms = system.select(["CA"]).tolist()
-    if len(atoms) == 0:
-        raise ValueError("No alpha carbon (CA) atoms were found in this file.")
-
+def align_to_first_frame(system, atoms):
+    """Coordinates of the given atoms, every frame rotated and moved onto frame 0 (Kabsch).
+    Used by RMSF and PCA, which must not see the protein's overall tumbling and drifting."""
     coords = system.coordinates[:, atoms, :].astype(float)   # (F, A, 3)
     n_frames = coords.shape[0]
 
@@ -222,7 +219,16 @@ def calculate_rmsf(system):
     correction[:, 2, 2] = d
     rot = vt.transpose(0, 2, 1) @ correction @ u.transpose(0, 2, 1)
 
-    aligned = np.einsum("fij,faj->fai", rot, mobile_c)      # (F, A, 3)
+    return np.einsum("fij,faj->fai", rot, mobile_c)         # (F, A, 3)
+
+
+def calculate_rmsf(system):
+    """RMSF (fluctuation) of each residue's alpha carbon, over the whole simulation."""
+    atoms = system.select(["CA"]).tolist()
+    if len(atoms) == 0:
+        raise ValueError("No alpha carbon (CA) atoms were found in this file.")
+
+    aligned = align_to_first_frame(system, atoms)           # (F, A, 3)
 
     average = aligned.mean(axis=0)                          # (A, 3)
     diff = aligned - average[None, :, :]
@@ -265,8 +271,10 @@ def calculate_rg(system):
 
 
 def calculate_hbonds(system):
-    """Hydrogen bond count per frame: the Baker-Hubbard rule (H-acceptor
-    under 2.5 A, donor-H-acceptor angle over 120 deg). Needs real H atoms."""
+    """Hydrogen bond counts per frame, shape (frames, 2): column 0 = bonds inside one chain
+    (intra-chain), column 1 = bonds between two different chains (inter-chain).
+    The Baker-Hubbard rule (H-acceptor under 2.5 A, donor-H-acceptor angle over 120 deg).
+    Needs real H atoms."""
     mask = system.protein_mask()
     heavy = [i for i in range(system.n_atoms) if mask[i] and system.elements[i] in ("N", "O")]
     hydrogens = [i for i in range(system.n_atoms) if mask[i] and system.elements[i] == "H"]
@@ -301,6 +309,10 @@ def calculate_hbonds(system):
     donor_heavy = np.array(donor_heavy)
     heavy = np.array(heavy)
 
+    # chain label of every donor and acceptor, to split the bonds into within-a-chain and between-chains
+    donor_chain = system.segids[donor_h]
+    heavy_chain = system.segids[heavy]
+
     counts = []
     for i in range(system.n_frames):
         h_pos = coords[i, donor_h, :]          # (D, 3)
@@ -319,9 +331,11 @@ def calculate_hbonds(system):
         norms = np.linalg.norm(to_donor, axis=1) * np.linalg.norm(to_acceptor, axis=1)
         cos_angle = (to_donor * to_acceptor).sum(axis=1) / np.where(norms == 0, 1.0, norms)
         angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
-        counts.append(int((angle > HBOND_ANGLE).sum()))
+        bonded = angle > HBOND_ANGLE
+        same_chain = donor_chain[d_index] == heavy_chain[a_index]
+        counts.append([int((bonded & same_chain).sum()), int((bonded & ~same_chain).sum())])
 
-    return counts
+    return np.array(counts)
 
 
 # C-terminal oxygens are named differently by each force field (OT1/OT2, OC1/OC2, O1/O2);
@@ -392,6 +406,56 @@ def calculate_secondary_structure(system):
     return md.compute_dssp(mdtraj_protein(system)).tolist()
 
 
+def calculate_torsions(system):
+    """Backbone torsion angles (phi, psi) of every residue in every frame, in degrees.
+    Returns two arrays of shape (frames, residues); NaN where the angle does not exist
+    (phi of a chain's first residue, psi of its last). Residue k here is residue k of
+    the mdtraj protein, see residue_labels()."""
+    protein = mdtraj_protein(system)
+    n_residues = protein.n_residues
+    phi = np.full((system.n_frames, n_residues), np.nan)
+    psi = np.full((system.n_frames, n_residues), np.nan)
+
+    # each angle belongs to the residue of its 2nd atom (phi: N, psi: CA)
+    phi_atoms, phi_angles = md.compute_phi(protein)
+    for k, atoms in enumerate(phi_atoms):
+        phi[:, protein.topology.atom(atoms[1]).residue.index] = np.degrees(phi_angles[:, k])
+    psi_atoms, psi_angles = md.compute_psi(protein)
+    for k, atoms in enumerate(psi_atoms):
+        psi[:, protein.topology.atom(atoms[1]).residue.index] = np.degrees(psi_angles[:, k])
+
+    if np.isnan(phi).all() and np.isnan(psi).all():
+        raise ValueError("No backbone torsion angles could be found in this file.")
+    return phi, psi
+
+
+def residue_labels(system):
+    """Name and number of each protein residue, e.g. "ALA 12", in the order of calculate_torsions."""
+    return ["%s %d" % (r.name, r.resSeq) for r in mdtraj_protein(system).topology.residues]
+
+
+def calculate_pca(system, max_components=10):
+    """Principal component analysis of the alpha-carbon motion. Every frame is first fitted
+    onto frame 0, then the main directions of movement are found. Returns (scores, percent):
+    scores (frames, components) = where each frame sits along each component, and
+    percent (components) = how much of the total motion each component explains."""
+    if system.n_frames < 3:
+        raise ValueError("PCA needs at least 3 frames.")
+    atoms = system.select(["CA"])
+    if len(atoms) < 2:
+        raise ValueError("PCA needs at least 2 alpha carbon (CA) atoms.")
+
+    aligned = align_to_first_frame(system, atoms)
+    flat = aligned.reshape(system.n_frames, -1)             # (F, 3A)
+    flat = flat - flat.mean(axis=0)
+
+    u, s, _ = np.linalg.svd(flat, full_matrices=False)      # the PCA, done through the SVD
+    if s.sum() == 0:
+        raise ValueError("The alpha carbons do not move, so there is nothing to analyse.")
+    k = min(max_components, len(s))
+    return u[:, :k] * s[:k], (s ** 2 / (s ** 2).sum() * 100)[:k]
+
+
 def summarize(codes):
     """Turn the DSSP letters of one frame into helix %, sheet % and coil %."""
     # DSSP marks unassignable ends as "NA"; skip them
@@ -423,6 +487,7 @@ def per_frame_csv(system, results):
         return round(results[name][i], 6)
 
     columns = ["frame", "time_ps", "rmsd_A", "rg_A", "sasa_A2", "hydrogen_bonds",
+               "hbonds_intra_chain", "hbonds_inter_chain", "pc1", "pc2",
                "com_x_A", "com_y_A", "com_z_A", "helix_percent", "sheet_percent", "coil_percent"]
     text = io.StringIO()
     writer = csv.writer(text, lineterminator="\n")
@@ -433,6 +498,10 @@ def per_frame_csv(system, results):
             com = ["", "", ""]
         else:
             com = [round(x, 6) for x in results["com"][i]]
+        if results["pca"] is None:
+            pcs = ["", ""]
+        else:
+            pcs = [round(x, 6) for x in results["pca"][i][:2]]
         if results["secondary"] is None:
             shapes = ["", "", ""]
         else:
@@ -440,7 +509,8 @@ def per_frame_csv(system, results):
 
         # "frame" is the frame's number in the original file (they differ when frames were skipped)
         writer.writerow([system.frame_numbers[i], round(float(system.time[i]), 6), value("rmsd", i), value("rg", i),
-                         value("sasa", i), value("hbonds", i), *com, *shapes])
+                         value("sasa", i), value("hbonds", i), value("hbonds_intra", i),
+                         value("hbonds_inter", i), *pcs, *com, *shapes])
 
     return text.getvalue()
 

@@ -40,6 +40,8 @@ def run_all_analysis(system, with_sasa=True, sasa_points=960):
         "hbonds": analysis.calculate_hbonds,
         "sasa": analysis.calculate_sasa,
         "secondary": analysis.calculate_secondary_structure,
+        "torsions": analysis.calculate_torsions,
+        "pca": analysis.calculate_pca,
     }
 
     results = {}
@@ -57,6 +59,15 @@ def run_all_analysis(system, with_sasa=True, sasa_points=960):
         except Exception as error:
             results[name] = None
             errors[name] = type(error).__name__ + ": " + str(error)
+
+    # three of the measurements return several arrays at once; give each its own name
+    hbonds = results["hbonds"]                              # (frames, 2): within chains, between chains
+    results["hbonds_intra"] = None if hbonds is None else hbonds[:, 0]
+    results["hbonds_inter"] = None if hbonds is None else hbonds[:, 1]
+    results["hbonds"] = None if hbonds is None else hbonds.sum(axis=1)
+    results["phi"], results["psi"] = (None, None) if results["torsions"] is None else results["torsions"]
+    del results["torsions"]
+    results["pca"], results["pca_percent"] = (None, None) if results["pca"] is None else results["pca"]
 
     # numpy arrays, so reading a value for any frame later is an instant lookup
     for name in results:
@@ -164,19 +175,43 @@ def make_plot(system, results, frame, metric, x_values, gromacs_units, rmsd_refe
         figure.update_layout(height=700)
         return figure
 
+    # each PCA point is one frame, placed by how it moves along the two main directions of motion
+    if metric == "PCA":
+        percent = results["pca_percent"]
+        figure = go.Figure(go.Scatter(
+            x=results["pca"][:, 0] * scale, y=results["pca"][:, 1] * scale, mode="markers", name="frames",
+            marker=dict(size=7, color=x_values, colorscale="Viridis",
+                        colorbar=dict(title=x_title)),
+            hovertemplate="frame %{customdata}<br>PC1 %{x:.2f}<br>PC2 %{y:.2f}<extra></extra>",
+            customdata=np.arange(system.n_frames),
+        ))
+        # the frame on screen in the 3D viewer, a red ring (not clickable: hoverinfo is off)
+        figure.add_trace(go.Scatter(
+            x=[results["pca"][frame, 0] * scale], y=[results["pca"][frame, 1] * scale], mode="markers",
+            marker=dict(size=14, color="rgba(0,0,0,0)", line=dict(color="red", width=3)),
+            hoverinfo="skip", showlegend=False))
+        figure.update_layout(xaxis_title="PC1 (%.1f%% of the motion)" % percent[0],
+                             yaxis_title="PC2 (%.1f%% of the motion)" % percent[1], height=450)
+        return figure
+
     if metric == "RMSD":
-        values = np.array(results["rmsd"]) * scale
+        lines = {"RMSD": np.array(results["rmsd"]) * scale}
         y_title = "RMSD vs frame %d (%s)" % (rmsd_reference, unit)
-    else:
-        values = np.array(results["rg"]) * scale
+    elif metric == "Rg":
+        lines = {"Rg": np.array(results["rg"]) * scale}
         y_title = "Rg (" + unit + ")"
+    else:
+        lines = {"Within chains": results["hbonds_intra"], "Between chains": results["hbonds_inter"],
+                 "Total": results["hbonds"]}
+        y_title = "Hydrogen bonds"
 
     figure = go.Figure()
-    figure.add_trace(go.Scatter(
-        x=x_values, y=values, mode="lines+markers", name=metric,
-        # markers give clicks something to hit; a plain line has no target
-        marker=dict(size=5, opacity=0.15),
-    ))
+    for name, values in lines.items():
+        figure.add_trace(go.Scatter(
+            x=x_values, y=values, mode="lines+markers", name=name,
+            # markers give clicks something to hit; a plain line has no target
+            marker=dict(size=5, opacity=0.15),
+        ))
 
     # a red line showing which frame is on screen in the 3D viewer
     figure.add_vline(x=x_values[frame], line_color="red", line_dash="dash", opacity=0.6)
@@ -190,6 +225,36 @@ def make_plot(system, results, frame, metric, x_values, gromacs_units, rmsd_refe
     return figure
 
 
+def show_torsions(results, labels, residue, frame, x_values, gromacs_units):
+    """Left: phi and psi of one residue over the whole trajectory. Right: the Ramachandran
+    plot (phi against psi) of every residue at the frame on screen, the chosen residue in red."""
+    phi = results["phi"][:, residue]
+    psi = results["psi"][:, residue]
+    st.caption("At frame %d, %s: phi = %s, psi = %s" % (
+        frame, labels[residue], show_number(phi[frame], "deg"), show_number(psi[frame], "deg")))
+    col1, col2 = st.columns(2)
+
+    over_time = go.Figure()
+    over_time.add_trace(go.Scatter(x=x_values, y=phi, mode="lines", name="phi"))
+    over_time.add_trace(go.Scatter(x=x_values, y=psi, mode="lines", name="psi"))
+    over_time.add_vline(x=x_values[frame], line_color="red", line_dash="dash", opacity=0.6)
+    over_time.update_layout(title=labels[residue], xaxis_title="Time (ns)" if gromacs_units else "Frame",
+                            yaxis_title="Angle (degrees)", yaxis_range=[-180, 180], height=350)
+    col1.plotly_chart(over_time, key="torsion_time")
+
+    ramachandran = go.Figure()
+    ramachandran.add_trace(go.Scatter(
+        x=results["phi"][frame], y=results["psi"][frame], mode="markers", name="residues",
+        text=labels, hovertemplate="%{text}<br>phi %{x:.0f}<br>psi %{y:.0f}<extra></extra>"))
+    ramachandran.add_trace(go.Scatter(
+        x=[phi[frame]], y=[psi[frame]], mode="markers", name=labels[residue],
+        marker=dict(color="red", size=11)))
+    ramachandran.update_layout(title="Ramachandran plot, frame %d" % frame, xaxis_title="phi (degrees)",
+                               yaxis_title="psi (degrees)", xaxis_range=[-180, 180],
+                               yaxis_range=[-180, 180], height=350)
+    col2.plotly_chart(ramachandran, key="torsion_rama")
+
+
 def handle_click(event, x_values):
     """Jump to the clicked frame, or select a dragged range."""
     if event is None:
@@ -201,7 +266,22 @@ def handle_click(event, x_values):
 
     # a point's x is a frame number or a time; find which frame it belongs to
     clicked = sorted(set(int(np.argmin(np.abs(x_values - point["x"]))) for point in points))
+    jump_to_frames(clicked)
 
+
+def handle_pca_click(event):
+    """Same as handle_click for the PCA graph, where a point's x is a PC value, not a frame:
+    the point's own number is the frame. Curve 0 is the frames; curve 1 is only the red ring."""
+    if event is None:
+        return
+    clicked = sorted(set(point["point_index"] for point in event.selection["points"]
+                         if point["curve_number"] == 0))
+    if len(clicked) > 0:
+        jump_to_frames(clicked)
+
+
+def jump_to_frames(clicked):
+    """Show one clicked frame, or select the range from the first to the last clicked frame."""
     # slider's already drawn this run, so stash the value for next run
     if len(clicked) == 1:
         st.session_state["new_frame"] = clicked[0]
@@ -271,6 +351,7 @@ def main():
             st.session_state["periodic"] = analysis.check_periodic_split(system)
             st.session_state["frame"] = 0
             st.session_state["selected_range"] = None
+            st.session_state.pop("torsion_residue", None)
         except ValueError as error:
             # our own checks in molecule.py, already worded for the user
             st.error(str(error))
@@ -372,7 +453,7 @@ def main():
         x_values = np.arange(system.n_frames)
 
     choices = []
-    for name, label in [("rmsd", "RMSD"), ("rmsf", "RMSF"), ("rg", "Rg")]:
+    for name, label in [("rmsd", "RMSD"), ("rmsf", "RMSF"), ("rg", "Rg"), ("hbonds", "H-bonds"), ("pca", "PCA")]:
         if results[name] is not None:
             choices.append(label)
 
@@ -384,19 +465,36 @@ def main():
         figure = make_plot(system, results, frame, metric, x_values, gromacs_units, rmsd_reference)
 
         # the RMSD and Rg graphs can be clicked to change the frame
-        if metric == "RMSD" or metric == "Rg":
+        if metric in ("RMSD", "Rg", "H-bonds", "PCA"):
             st.caption("Click a point to jump to that frame. To select a range, "
                        "pick the box select tool (dashed square) in the chart's "
                        "toolbar first, then drag across the graph.")
+            if metric == "PCA":
+                st.caption("Each dot is one frame, placed by the two biggest movements of the alpha "
+                           "carbons (after fitting every frame onto frame 0). Frames close together "
+                           "have similar shapes.")
             event = st.plotly_chart(
                 figure,
                 on_select="rerun",
                 selection_mode=["points", "box", "lasso"],
                 key="graph",
             )
-            handle_click(event, x_values)
+            if metric == "PCA":
+                handle_pca_click(event)
+            else:
+                handle_click(event, x_values)
         else:
             st.plotly_chart(figure, key="graph")
+
+    # --- the torsion angles of one residue ---
+    st.subheader("Torsion angles (phi / psi)")
+    if results["phi"] is None:
+        st.info("Torsion angles could not be calculated for this file.")
+    else:
+        labels = analysis.residue_labels(system)
+        residue = st.selectbox("Residue", range(len(labels)), format_func=lambda k: labels[k],
+                               key="torsion_residue")
+        show_torsions(results, labels, residue, frame, x_values, gromacs_units)
 
     # --- the results as files, for plotting in other programs ---
     st.subheader("Download the results")
@@ -415,6 +513,8 @@ def main():
     col2.metric("Radius of gyration", show_number(value_at_frame(results, "rg", frame), "A"))
     col3.metric("SASA", show_number(value_at_frame(results, "sasa", frame), "A2"))
     col3.metric("Hydrogen bonds", show_number(value_at_frame(results, "hbonds", frame)))
+    col3.metric("H-bonds within chains", show_number(value_at_frame(results, "hbonds_intra", frame)))
+    col3.metric("H-bonds between chains", show_number(value_at_frame(results, "hbonds_inter", frame)))
     col4.metric("Centre of mass", show_center_of_mass(value_at_frame(results, "com", frame)))
     col4.markdown("**Secondary structure**")
     col4.markdown(show_secondary_structure(results["secondary"], frame))
@@ -433,6 +533,8 @@ def main():
     col2.metric("Average Rg", average_over_range(results, "rg", start, end, "A"))
     col3.metric("Average SASA", average_over_range(results, "sasa", start, end, "A2"))
     col4.metric("Average hydrogen bonds", average_over_range(results, "hbonds", start, end))
+    col3.metric("Average H-bonds within chains", average_over_range(results, "hbonds_intra", start, end))
+    col4.metric("Average H-bonds between chains", average_over_range(results, "hbonds_inter", start, end))
 
     if results["rmsd"] is not None:
         rmsd_values = results["rmsd"][start:end + 1]

@@ -180,6 +180,29 @@ matched to their covalently bonded heavy atom (N or O) using a simple nearest-ne
 distance cutoff (`BOND_LENGTH` = 1.3 Å, a typical N–H/O–H bond length), computed
 once from frame 0 since covalent bonding doesn't change during a simulation.
 
+It returns an array of shape `(frames, 2)`: column 0 counts bonds whose donor and
+acceptor are in the same chain (segid, intra-chain), column 1 counts bonds between two
+different chains (inter-chain). `run_all_analysis` stores these as `hbonds_intra`,
+`hbonds_inter` and their sum `hbonds`.
+
+### `align_to_first_frame(system, atoms)`
+Kabsch-fits every frame onto frame 0 for the given atoms and returns the aligned
+coordinates. Shared by `calculate_rmsf` and `calculate_pca`.
+
+### `calculate_torsions(system)` / `residue_labels(system)`
+Backbone phi and psi of every residue in every frame, in degrees, from mdtraj's
+`compute_phi` / `compute_psi` on the cached protein. Two `(frames, residues)` arrays, NaN
+where the angle does not exist (phi of a chain's first residue, psi of its last). Checked
+against MDAnalysis' `Ramachandran` (same values to 4 decimals). The app shows phi/psi of a
+chosen residue over time and a Ramachandran plot of the frame on screen. Side-chain (chi)
+angles are not calculated.
+
+### `calculate_pca(system, max_components=10)`
+PCA of the alpha-carbon motion: fit all frames onto frame 0, flatten to `(frames, 3 x CA)`,
+subtract the mean, and take the SVD. Returns the scores `(frames, components)` (each frame's
+position along each principal component) and the percent of the motion each explains. Needs
+at least 3 frames. The PC1/PC2 plot is clickable like the other graphs.
+
 ### `mdtraj_protein(system)`
 Builds the protein as an **mdtraj** trajectory (cached on the `system` object) from
 MDExplorer's own arrays: an `md.Topology` with one chain per run of residues (a new chain
