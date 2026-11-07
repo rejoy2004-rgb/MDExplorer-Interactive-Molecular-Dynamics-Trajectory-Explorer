@@ -42,75 +42,141 @@ solvent box around the protein would dominate the results.
 | RMSF | which residues are flexible and which are rigid | our own Python code, one value per alpha carbon, aligned with the same Kabsch step as RMSD |
 | Radius of gyration | how compact the folded protein is | our own Python code, mass weighted |
 | Centre of mass | whether the protein is drifting through the box | our own Python code |
-| Hydrogen bonds | whether the folded structure is holding together | our own Python code, the Baker-Hubbard geometric rule: H...acceptor under 2.5 A and a donor-H...acceptor angle over 120 degrees |
+| Hydrogen bonds | whether the folded structure is holding together | our own Python code, the Baker-Hubbard geometric rule: H...acceptor under 2.5 A and a donor-H...acceptor angle over 120 degrees. Each bond is counted as **within a chain** (intra-chain) or **between two chains** (inter-chain), by the chain label of its donor and acceptor |
 | SASA | how much surface is exposed to water | freesasa (Shrake-Rupley, 960 points per atom, or 100 for the faster option) |
 | Secondary structure | the helix / sheet / coil percentages | mdtraj (DSSP, simplified 3-class output: H, E, C) |
+| Torsion angles (phi / psi) | the backbone angles of each residue, frame by frame | mdtraj (`compute_phi`, `compute_psi`), stored per residue; blank where an angle does not exist (phi of a chain's first residue, psi of its last) |
+| PCA | the main directions in which the protein moves | our own NumPy code: every frame's alpha carbons fitted onto frame 0 (the same Kabsch step), then the principal components from an SVD |
 
-The last two use a library because the algorithms behind them are much bigger
-than the rest. Everything else is calculated directly from the NumPy arrays.
+SASA, secondary structure and the torsion angles use a library because the algorithms
+behind them are much bigger than the rest. Everything else is calculated directly from
+the NumPy arrays.
+
+## Everything is calculated once, at load
+
+All the work happens right after **Load simulation**: every measurement, the RMSD against
+**every** possible reference frame (a frames x frames table), the 3D picture of every frame
+and the CSV files. Everything is kept as NumPy arrays, so once the page appears, clicking a
+point on a graph, moving the frame slider or changing the RMSD reference frame only looks
+values up and answers at once. Loading takes longer in exchange; see Known limitations.
 
 ## What the page does
 
-* the protein is drawn in 3D with PyMOL (rendered as an image of the current
-  frame), and a slider moves through the frames
-* the graph can be clicked to jump the 3D view to that frame
-* dragging a box across the graph selects a range of frames, and the averages
-  over that range are shown underneath
+* **3D structure, drawn by PyMOL**: cartoon, ligands as sticks, and magenta dots on the
+  protein residues within 5 A of a ligand (the binding pocket). Black background, like PyMOL.
+  * **Free rotation** (on by default): drag to rotate, scroll to zoom, right-drag to move.
+    These are PyMOL's own 3D shapes, exported and drawn in the browser with three.js using
+    PyMOL's lighting settings and depth cueing, so it looks like the PyMOL picture.
+  * Untick it for the **still PyMOL picture** of the frame. It changes frame instantly.
+  * In both, **click an atom** (the alpha carbon of a residue, or any ligand atom) to label it
+    with its chain, residue and atom name. Click a second atom to get a **yellow dashed line
+    with the distance** in A, like PyMOL's distance measurement. In the still picture the
+    labels stay when you change frame, so you can watch a distance change.
+  * **Colour the protein by** (sidebar): secondary structure (helices red, strands yellow,
+    loops green, the default), rainbow (blue at the first residue to red at the last) or chain.
+* **Play frames**: pick a range of frames and the speed, and play them to watch the protein
+  move. Stop, or any other click, ends it.
+* the graphs can be clicked to jump the 3D view to that frame
+* dragging a box across the RMSD, Rg or H-bond graph selects a range of frames, and the
+  averages over that range are shown underneath
+* **Graphs**: RMSD, RMSF, radius of gyration, **hydrogen bonds** (within chains, between
+  chains and total) and **PCA** (each frame as a dot along the first two principal components,
+  coloured by time; clicking a dot jumps to that frame)
+* **Torsion angles**: pick a residue to see its phi and psi over the whole trajectory, next to
+  a Ramachandran plot of every residue in the frame on screen
 * if one measurement cannot be calculated, the page says which one and shows
   the reason, and the other measurements still appear
 * **Use every Nth frame** (sidebar): a long trajectory can be read every 10th or
   100th frame. The frames keep their original times and numbers.
 * **RMSD reference frame**: RMSD is measured against the first frame unless you
-  pick another one. Changing it recalculates only the RMSD.
+  pick another one. Every reference was calculated at load, so the switch is instant.
 * **GROMACS-style graphs**: one checkbox switches the graphs to time in ns and
   distances in nm, like `gmx rms`, `gmx gyrate` and `gmx rmsf` plots. Clicking a
   point still jumps to the right frame. The numbers under the graph stay in ps
   and A.
-* **Download the results** as two CSV files: every per-frame value, and the RMSF
-  of each residue.
+* **Download the results** as two CSV files: every per-frame value (now including the
+  within/between-chain hydrogen bonds and PC1 and PC2), and the RMSF of each residue.
 
 ## Screenshots
 
 The screenshots use Adenylate Kinase (214 residues, 3,341 atoms, 98 frames)
-from the MDAnalysis test files (`adk.psf` + `adk_dims.dcd`).
+from the MDAnalysis test files (`adk.psf` + `adk_dims.dcd`), loaded through the page with
+every frame, SASA and Fast SASA on, and the default colours.
 
-**Overview: file upload (with "Use every Nth frame"), simulation information and
-the 3D structure at the chosen frame.** The slider moves through the frames.
+**Overview: the sidebar (files, "Use every Nth frame", the SASA tick boxes, high quality
+render and the colour scheme), simulation information and the 3D structure.** Loading these
+98 frames with SASA took about 200 s on the development PC; after that every click answers
+at once.
 
-![Overview of the page: uploaded files, simulation information and the 3D structure](screenshots/01_overview.png)
+![Overview of the page: uploaded files, sidebar options, simulation information and the 3D structure](screenshots/01_overview.png)
 
-**RMSD graph, the CSV download buttons and the numbers for the frame on screen.**
-The red dashed line marks the frame shown in 3D. Clicking a point on the graph
-jumps to that frame.
+**Free rotation.** PyMOL's own 3D shapes, turned with the mouse. Two atoms were clicked:
+each gets a label (chain, residue, atom) and the yellow dashed line gives their distance in A.
 
-![RMSD graph with the current frame marked, and the measurements for that frame](screenshots/02_analysis_rmsd.png)
+![The 3D structure turned with the mouse, with two labelled atoms and the distance between them](screenshots/02_3d_free_rotation.png)
+
+**The still PyMOL picture** (free rotation unticked), with two clicked atoms and their
+distance. Here the labels stay when the frame changes, and the distance follows the frame.
+
+![The still PyMOL picture with two labelled atoms and their distance](screenshots/03_3d_still_picture.png)
+
+**Colour schemes** (sidebar, "Colour the protein by"): secondary structure (top left),
+rainbow (top right) and chain (bottom left), drawn by PyMOL; bottom right is the free-rotation
+view in secondary-structure colours.
+
+![The same protein coloured by secondary structure, rainbow and chain, and the free-rotation view](screenshots/14_colour_schemes.png)
+
+**Play frames**: choose the range and the speed, then Play.
+
+![The play frames controls: a frame range, frames per second, Play and Stop](screenshots/04_play_frames.png)
+
+**RMSD graph with a selected range.** The red dashed line marks the frame shown in 3D;
+clicking a point jumps to that frame. Dragging a box (after picking the box select tool in
+the chart's toolbar) shades a range of frames...
+
+![RMSD graph with the current frame marked and frames 33 to 59 shaded](screenshots/05_rmsd_graph_range.png)
+
+...and shows the averages over those frames:
+
+![Averages of RMSD, Rg, SASA and hydrogen bonds over the selected frames](screenshots/06_selected_frames.png)
+
+**Hydrogen bonds**: within chains, between chains and the total. This protein has one chain,
+so "within" is the total and "between" is 0.
+
+![Hydrogen bonds per frame, within chains, between chains and total](screenshots/07_hydrogen_bonds.png)
+
+**PCA**: each dot is one frame, placed along the two biggest movements of the alpha carbons
+and coloured by time (here PC1 explains 90% of the motion). Clicking a dot jumps to that frame;
+the red ring marks the frame on screen.
+
+![PCA plot: every frame along PC1 and PC2, coloured by frame number](screenshots/08_pca.png)
 
 **RMSF per residue**, with the real residue numbers on the x axis.
 
-![RMSF bar chart for each residue](screenshots/03_rmsf.png)
+![RMSF bar chart for each residue](screenshots/09_rmsf.png)
 
-**Frame-range selection.** Dragging a box across the graph shades the range and
-shows the averages (and the lowest and highest RMSD) over those frames.
+**Torsion angles** of one residue (here GLY 12) over the whole trajectory, and the
+Ramachandran plot of all residues in the frame on screen, the chosen residue in red.
 
-![A selected range of frames and its average RMSD, Rg, SASA and hydrogen bonds](screenshots/04_range_selection.png)
+![Phi and psi of GLY 12 over time, and the Ramachandran plot of frame 0](screenshots/10_torsion_angles.png)
+
+**The download buttons and the numbers for the frame on screen**, including the hydrogen
+bonds within and between chains.
+
+![CSV download buttons and the measurements of the current frame](screenshots/11_this_frame.png)
 
 **GROMACS-style graphs and another RMSD reference frame.** The checkbox shows time
 in ns and distances in nm. Here frame 30 is the reference, so the curve reaches 0
 at frame 30.
 
-![RMSD against frame 30 with time in ns and distance in nm](screenshots/06_gromacs_units_and_reference.png)
-
-The sidebar has two SASA tick boxes. **Calculate SASA** turns it on; **Fast SASA** (on by default) uses
-100 sphere points per atom instead of 960, about 5x faster:
-
-![The sidebar with the Calculate SASA and Fast SASA tick boxes, and the 3D structure](screenshots/07_fast_sasa_option.png)
+![RMSD against frame 30 with time in ns and distance in nm](screenshots/12_gromacs_units_and_reference.png)
 
 **Periodic-boundary warning.** This raw GROMACS output (`adk_oplsaa.gro` +
 `adk_oplsaa.xtc`) has the protein cut by the edge of the simulation box, which is
 visible in the 3D picture. MDExplorer warns that RMSD, RMSF and the other
 measurements may be misleading (see the next section).
 
-![Warning that the protein may cross a periodic boundary, with the split protein shown in 3D](screenshots/05_periodic_boundary_warning.png)
+![Warning that the protein may cross a periodic boundary, with the split protein shown in 3D](screenshots/13_periodic_boundary_warning.png)
 
 ## Periodic-boundary warning
 
@@ -186,7 +252,8 @@ For that protein MDExplorer finds an RMSD that rises to 1.39 nm, a radius of gyr
 falling from 3.11 to 2.70 nm, and the largest fluctuation (1.92 nm) at residue 430 in the
 flexible C-terminal end. Loading all 10,001 frames takes 9 s and 0.9 GB. All seven measurements
 for all 10,001 frames took about 220 seconds with Fast SASA, about 70% of it SASA (157 s;
-hydrogen bonds 12 s).
+hydrogen bonds 12 s). That timing is from before the load also drew a 3D picture of every frame
+and the RMSD against every reference frame, so a load is now slower (see Known limitations).
 
 **GROMACS itself was not installed on the development computer**, so the "as GROMACS
 defines it" row is MDAnalysis using GROMACS's definitions, not GROMACS's own output. To finish
@@ -217,7 +284,15 @@ this code); SASA from freesasa is within 0.03 to 0.74% of mdtraj's on five frame
 different atomic radii); secondary structure agrees with MDAnalysis' own DSSP for 96.6%
 of residues.
 
-**File formats.** All seven measurements ran on every combination tried:
+**The newer measurements.** The phi and psi angles agree with MDAnalysis' `Ramachandran`
+analysis to 4 decimal places (cobrotoxin, MDAnalysis test files). The split of hydrogen bonds
+was checked on HIV protease (`1hvr.pdb`, two chains): 126 within chains and 21 between them;
+a single-chain protein gives 0 between chains. The RMSD table for every reference frame was
+checked against a fresh RMSD calculation for that reference. PCA has not been compared with
+another program.
+
+**File formats.** The first seven measurements (not yet the torsion angles and PCA) ran on
+every combination tried:
 
 | Topology + trajectory | Tested with |
 | --- | --- |
@@ -259,11 +334,25 @@ For a whole protein the effect of one pair is tiny, but MDExplorer does not warn
 * Streamlit's upload limit is raised to 2,000 MB in `.streamlit/config.toml`; a bigger
   trajectory has to be shortened first (for example `gmx trjconv -dt`).
 * Loading time depends on the number of frames, the number of atoms and your
-  computer. Example from one Windows PC with 12 logical cores: a 7,148-atom protein,
-  10,001 frames, every frame, took about 220 s in total with Fast SASA (SASA about 157 s,
-  hydrogen bonds 12 s, secondary structure 23 s, loading 5 s). A 3,341-atom protein took
-  about 0.14 s per frame for SASA at 960 points on one core. These are examples, not
-  guarantees; use **Use every Nth frame** to cut the time further.
+  computer. Everything is calculated at load, so loading is the slow part: Adenylate Kinase
+  (3,341 atoms, 98 frames, SASA with Fast SASA) took about 200 s on the development PC,
+  including a PyMOL picture of every frame. The RMSD against every reference frame grows with
+  the square of the number of frames, so a long trajectory should be read with **Use every
+  Nth frame**. Older example, before the pictures and the RMSD table were added: a 7,148-atom
+  protein, 10,001 frames, took about 220 s with Fast SASA. These are examples, not guarantees.
+* Each frame's picture is kept in memory (about 100 KB per frame).
+* **Free rotation** builds the 3D shapes of a frame when that frame is shown (about half a
+  second, and a few MB sent to the browser), because keeping them for every frame would need
+  several MB per frame. The still picture changes frame instantly, and playback uses it.
+  Free rotation also needs internet in the browser (three.js is loaded from a CDN), and its
+  labels are cleared when the frame changes.
+* Only alpha carbons and ligand atoms can be clicked in the 3D view (side chains are not drawn).
+* A residue counts as protein if its name is a standard amino acid or one of the common
+  force-field and modified names listed in `viewer.py` (HSD, HIE, CYX, MSE, ...). Anything
+  else is drawn as a ligand, with pocket dots around it; an unusual residue name may need
+  adding to that list.
+* The hydrogen-bond split uses the chain (segment) label of each atom. A file that gives all
+  chains the same label counts every bond as "within chains".
 
 ## Libraries used
 
@@ -272,10 +361,11 @@ For a whole protein the effect of one pair is tiny, but MDExplorer does not warn
 | MDAnalysis | opening the simulation files |
 | NumPy | all the arrays and most of the maths |
 | freesasa | SASA |
-| mdtraj | DSSP (secondary structure) |
+| mdtraj | DSSP (secondary structure) and the phi / psi angles |
 | Streamlit | the web page |
-| Plotly | the graphs |
-| PyMOL (pymol-open-source-whl) | the 3D view |
+| Plotly | the graphs, and the clickable still 3D picture |
+| PyMOL (pymol-open-source-whl) | the 3D pictures, and the 3D shapes for free rotation |
+| three.js (loaded in the browser, not installed) | drawing PyMOL's 3D shapes for free rotation |
 
 ## Files
 
@@ -283,8 +373,8 @@ There are only four of them:
 
 ```
 molecule.py    the MolecularSystem class, and reading a file into one
-analysis.py    all seven measurements, and the CSV files
-viewer.py      writes a frame as PDB text and draws it in 3D
+analysis.py    all the measurements, and the CSV files
+viewer.py      draws a frame with PyMOL (picture and free-rotation view)
 app.py         the Streamlit page, this is what you run
 ```
 
@@ -292,7 +382,7 @@ Besides them: `.streamlit/config.toml`, which raises the upload limit.
 
 ## Running it
 
-Install the requirements once:
+Install the requirements once (and again after updating, in case they changed):
 
 ```
 pip install -r requirements.txt
@@ -310,3 +400,6 @@ Upload the topology file first (PDB, PSF, GRO, TPR or PRMTOP), then the
 trajectory file (DCD, XTC, TRR or NC), and click **Load simulation**. A plain
 `.pdb` file already contains coordinates, so for that one no trajectory file is
 needed. For a long trajectory, set **Use every Nth frame** before loading.
+
+After changing the code, stop the app (Ctrl + C in the terminal) and start it again;
+refreshing the browser alone can keep an old copy of `viewer.py` loaded.
