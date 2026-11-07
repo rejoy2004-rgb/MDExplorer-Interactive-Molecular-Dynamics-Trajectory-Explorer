@@ -31,9 +31,16 @@ import numpy as np
 from multiprocessing import Pool, cpu_count
 
 
-_COORDS = None
 _RADII = None
 _PARAMETERS = None
+
+# freesasa prints a warning for every atom name it does not know (e.g. CHARMM hydrogens),
+# thousands of lines per load; the radii are checked below instead
+freesasa.setVerbosity(freesasa.nowarnings)
+
+# van der Waals radii (A) for an atom freesasa could not size, by element; the same values
+# freesasa itself falls back to for these elements
+ELEMENT_RADII = {"H": 1.10, "C": 1.70, "N": 1.55, "O": 1.52, "S": 1.80, "P": 1.80}
 
 
 def _make_parameters(n_points):
@@ -44,17 +51,15 @@ def _make_parameters(n_points):
     return parameters
 
 
-def _init_worker(coords, radii, n_points):
-    global _COORDS, _RADII, _PARAMETERS
-    _COORDS = coords
+def _init_worker(radii, n_points):
+    global _RADII, _PARAMETERS
     _RADII = radii
     _PARAMETERS = _make_parameters(n_points)
 
 
-def _compute_frame(frame):
+def _compute_frame(frame_xyz):
     # calcCoord needs only the coordinates (flat x,y,z list) and one radius per atom
-    xyz = _COORDS[frame].ravel().tolist()
-    return freesasa.calcCoord(xyz, _RADII, _PARAMETERS).totalArea()
+    return freesasa.calcCoord(frame_xyz.ravel().tolist(), _RADII, _PARAMETERS).totalArea()
 
 
 def _protein_radii(system, protein_atoms):
@@ -75,7 +80,13 @@ def _protein_radii(system, protein_atoms):
             chain,
             float(x), float(y), float(z),
         )
-    return [structure.radius(k) for k in range(structure.nAtoms())]
+    # some freesasa versions read a name like "HA" as an unknown two-letter element and give
+    # it radius 0, which leaves the atom out of the area; use the radius of its element instead
+    radii = [structure.radius(k) for k in range(structure.nAtoms())]
+    for k, i in enumerate(protein_atoms):
+        if radii[k] <= 0:
+            radii[k] = ELEMENT_RADII.get(system.elements[i], 1.80)
+    return radii
 
 
 def calculate_sasa_freesasa(system, n_points=960):
@@ -87,13 +98,14 @@ def calculate_sasa_freesasa(system, n_points=960):
         raise ValueError("No protein atoms were found in this file.")
 
     radii = _protein_radii(system, protein_atoms)
-    coords = np.asarray(system.coordinates)[:, protein_atoms]
+    # one frame at a time: sending the whole trajectory to every worker ran out of memory
+    frames = (np.asarray(system.coordinates[f])[protein_atoms] for f in range(system.n_frames))
 
     # measured on a 12-core PC: 6 workers was fastest, 12 was slower than 4
     workers = min(cpu_count() or 1, 6, system.n_frames)
     if workers < 2:
-        _init_worker(coords, radii, n_points)
-        return [_compute_frame(frame) for frame in range(system.n_frames)]
+        _init_worker(radii, n_points)
+        return [_compute_frame(xyz) for xyz in frames]
 
-    with Pool(processes=workers, initializer=_init_worker, initargs=(coords, radii, n_points)) as pool:
-        return list(pool.map(_compute_frame, range(system.n_frames)))
+    with Pool(processes=workers, initializer=_init_worker, initargs=(radii, n_points)) as pool:
+        return list(pool.imap(_compute_frame, frames, chunksize=4))
